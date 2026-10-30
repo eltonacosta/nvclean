@@ -1,0 +1,31 @@
+# Artefatos de build — recriados por packaging/build-appimage.sh
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Grafo de conhecimento local (graphify)
+.graphify/
+
+# Editores e sistema
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Ambientes virtuais
+.venv/
+venv/
+
+# Arquivos temporários/logs
+*.log
+*.tmp

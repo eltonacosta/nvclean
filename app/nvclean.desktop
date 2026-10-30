@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=nvclean
+GenericName=Limpador de voz do microfone
+Comment=Remove ruído do microfone e expõe o microfone virtual "nvclean"
+Exec=nvclean-app
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=microphone;noise;ruido;denoise;nvclean;
+StartupNotify=true

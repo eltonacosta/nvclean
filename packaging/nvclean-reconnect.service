@@ -1,0 +1,17 @@
+[Unit]
+Description=nvclean — mantém o microfone ligado ao filtro de ruído
+Documentation=file://%h/.local/share/nvclean/README.md
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nvclean-reconnect
+Restart=always
+RestartSec=5
+# não compete com áudio em tempo real
+Nice=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,41 @@
+#!/bin/bash
+# ============================================================================
+# nvclean-reconnect — garante que o microfone escolhido continue ligado ao
+# filtro, mesmo depois de reiniciar o PipeWire ou reconectar o dispositivo.
+#
+# Roda como serviço de usuário: observa o PipeWire e, sempre que o nó
+# nvclean.input existir sem nenhuma fonte ligada, refaz o link com o
+# microfone salvo em ~/.config/nvclean/mic.
+#
+# Escopo: só cria links ENTRANDO em nvclean.input. Não toca na saída.
+# ============================================================================
+set -uo pipefail
+
+CONTROL="${NVCLEAN_CONTROL:-$HOME/.local/bin/nvclean-control}"
+SINK_NODE="nvclean.input"
+INTERVAL="${NVCLEAN_INTERVAL:-3}"
+
+[ -x "$CONTROL" ] || exit 1
+
+# Enquanto o PipeWire estiver de pé, verifica se existe fonte ligada ao filtro.
+while true; do
+  if command -v pw-dump >/dev/null 2>&1; then
+    state="$(timeout 10 "$CONTROL" status --json 2>/dev/null || true)"
+    if [ -n "$state" ]; then
+      if ! python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)          # estado ilegível: não faz nada
+sys.exit(0 if d.get("available") and not d.get("source_connected") else 1)
+' "$state"; then
+        # fonte conectada (ou filtro ainda não existe) — nada a fazer
+        sleep "$INTERVAL"
+        continue
+      fi
+      timeout 15 "$CONTROL" reconnect >/dev/null 2>&1 || true
+    fi
+  fi
+  sleep "$INTERVAL"
+done

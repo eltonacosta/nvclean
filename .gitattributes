@@ -1,0 +1,23 @@
+# Normaliza finais de linha para LF em todo o repositório.
+* text=auto eol=lf
+
+# Binários: nunca converter nem tratar como texto.
+*.png binary
+*.svg text
+*.so binary
+*.AppImage binary
+
+# Scripts e fontes que devem manter LF.
+*.sh text eol=lf
+nvclean-app text eol=lf
+nvclean-control text eol=lf
+nvclean-reconnect text eol=lf
+AppRun text eol=lf
+*.desktop text eol=lf
+*.service text eol=lf
+*.conf text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+
+# Diffs de documentação
+*.md text eol=lf

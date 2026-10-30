@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""nvclean-control — controlador do filtro de ruído de ENTRADA (microfone).
+
+Escopo: manipula SOMENTE o filtro do microfone (nós "nvclean.input" /
+"nvclean"). A saída de áudio do sistema — inclusive o boost 3x em
+51-boost3x.conf — não é lida, alterada nem reconectada.
+
+O nó virtual "nvclean" existe sempre (criado pelo filter-chain do PipeWire),
+então ligar/desligar é imediato e não reinicia o PipeWire: alterna o parâmetro
+Dry/Wet Mix do RNNoise entre 1.0 (filtro) e 0.0 (bypass).
+
+Uso:
+  nvclean-control on                 liga o filtro
+  nvclean-control off                desliga (bypass)
+  nvclean-control toggle             alterna
+  nvclean-control status [--json]    estado atual
+  nvclean-control intensity 0.6      intensidade do efeito (0..1)
+  nvclean-control mic                lista microfones disponíveis
+  nvclean-control mic <nome>         conecta este microfone ao filtro
+  nvclean-control level              nível RMS atual da entrada (dBFS)
+  nvclean-control doctor             diagnóstico do ambiente
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+
+SINK_NODE = "nvclean.input"   # Audio/Sink: recebe o microfone real
+SOURCE_NODE = "nvclean"       # Audio/Source: microfone virtual que os apps usam
+PARAM = "rnnoise:Dry/Wet Mix"
+PLUGIN = os.path.expanduser("~/.local/lib/ladspa/nvclean_rnnoise_stereo.so")
+CONF = os.environ.get(
+    "NVCLEAN_CONF",
+    os.path.expanduser("~/.config/pipewire/pipewire.conf.d/60-nvclean.conf"),
+)
+
+
+class Fail(Exception):
+    pass
+
+
+def _run(args: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            args, capture_output=True, text=True, timeout=10, check=check
+        )
+    except FileNotFoundError as exc:
+        raise Fail(f"{args[0]} não encontrado (instale pipewire)") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise Fail(f"timeout ao executar {args[0]}") from exc
+
+
+def dump() -> list[dict]:
+    proc = _run(["pw-dump"])
+    if proc.returncode != 0:
+        raise Fail(f"pw-dump falhou: {proc.stderr.strip() or proc.returncode}")
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise Fail(f"não foi possível ler o estado do PipeWire: {exc}") from exc
+
+
+def props(obj: dict) -> dict:
+    return (obj.get("info") or {}).get("props") or {}
+
+
+def node_id(objects: list[dict], name: str) -> int | None:
+    for obj in objects:
+        if props(obj).get("node.name") == name:
+            return obj.get("id")
+    return None
+
+
+def node(objects: list[dict], name: str) -> dict | None:
+    for obj in objects:
+        if props(obj).get("node.name") == name:
+            return obj
+    return None
+
+
+def get_mix(objects: list[dict] | None = None) -> float | None:
+    objects = objects if objects is not None else dump()
+    sink = node(objects, SINK_NODE)
+    if not sink:
+        return None
+    for item in ((sink.get("info") or {}).get("params") or {}).get("Props") or []:
+        q = item.get("params") or []
+        for i in range(0, len(q) - 1, 2):
+            if q[i] == PARAM:
+                try:
+                    return float(q[i + 1])
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
+def _state_file() -> str:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "nvclean", "last-intensity")
+
+
+def remember_intensity(value: float) -> None:
+    """Guarda a intensidade para o toggle off/on não perder o ajuste."""
+    try:
+        path = _state_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"{value:.3f}\n")
+    except OSError:
+        pass
+
+
+def recalled_intensity(default: float = 1.0) -> float:
+    try:
+        with open(_state_file(), encoding="utf-8") as fh:
+            value = float(fh.read().strip())
+        return min(1.0, max(0.01, value))
+    except (OSError, ValueError):
+        return default
+
+
+def set_mix(value: float, *, remember: bool = True) -> None:
+    objects = dump()
+    sink = node_id(objects, SINK_NODE)
+    if sink is None:
+        raise Fail(
+            f"nó {SINK_NODE} não existe. Instale/ative o filtro primeiro "
+            "(scripts/linux/setup-denoiser.sh)."
+        )
+    payload = '{ params: [ "%s", %s ] }' % (PARAM, value)
+    proc = _run(["pw-cli", "set-param", str(sink), "Props", payload])
+    if proc.returncode != 0:
+        raise Fail(f"falha ao ajustar {PARAM}: {proc.stderr.strip()}")
+    # `remember` é False para on/off/toggle: eles aplicam um valor derivado
+    # (a intensidade salva ou 0.0 de bypass) e não são a escolha do usuário.
+    # Memorizar o 0.0 do `off` faria o próximo `on` virar bypass silencioso.
+    # 0.0 é bypass, não uma intensidade escolhida: memorizá-lo faria o próximo
+    # `on` virar bypass silencioso (recalled_intensity clampa em 0.01, o que
+    # ainda deixaria a UI dizendo "ligado" com o filtro quase desligado).
+    if remember and value > 0.0:
+        remember_intensity(value)
+
+
+# ---------------------------------------------------------------------------
+# Microfone de origem
+# ---------------------------------------------------------------------------
+def list_mics(objects: list[dict] | None = None) -> list[tuple[str, str]]:
+    objects = objects if objects is not None else dump()
+    out: list[tuple[str, str]] = []
+    for obj in objects:
+        p = props(obj)
+        if p.get("media.class") != "Audio/Source":
+            continue
+        name = p.get("node.name", "")
+        if not name or name.startswith("nvclean") or name.endswith(".monitor"):
+            continue
+        out.append((name, p.get("node.description") or name))
+    return out
+
+
+def _port_matches(props_of_port: dict, direction: str) -> bool:
+    """Aceita 'out'/'in' (port.direction) e 'output'/'input' (info.direction)."""
+    raw = (
+        props_of_port.get("port.direction")
+        or props_of_port.get("direction")
+        or ""
+    ).lower()
+    if direction == "output":
+        return raw in ("out", "output")
+    if direction == "input":
+        return raw in ("in", "input")
+    return False
+
+
+def ports(objects: list[dict], nodename: str, direction: str) -> list[dict]:
+    """Portas de um nó, ordenadas (correspondência FL<->FL, FR<->FR).
+
+    As portas aparecem como objetos PipeWire:Interface:Port com `node.id` do
+    dono e `port.direction` = "out" | "in". Versões antigas expõem a lista em
+    `info.ports`; ambos os formatos são aceitos.
+    """
+    target = node_id(objects, nodename)
+    if target is None:
+        return []
+
+    found: list[dict] = []
+
+    for obj in objects:
+        p = props(obj)
+        if p.get("node.id") == target and _port_matches(p, direction):
+            found.append(p)
+
+    if not found:
+        owner = node(objects, nodename) or {}
+        for item in (owner.get("info") or {}).get("ports") or []:
+            if isinstance(item, dict):
+                p = item
+            else:
+                p = {}
+                for chunk in str(item).split(","):
+                    if "=" in chunk:
+                        k, v = chunk.split("=", 1)
+                        p[k.strip()] = v.strip()
+            if _port_matches(p, direction):
+                found.append(p)
+
+    found.sort(key=lambda p: p.get("port.name", "") or p.get("name", ""))
+    return found
+
+
+def links_into(objects: list[dict], dst_node: str) -> list[tuple[int, int]]:
+    """Retorna (id_do_link, porta_de_entrada) dos links que entram em dst_node."""
+    dst = node_id(objects, dst_node)
+    if dst is None:
+        return []
+    out = []
+    for obj in objects:
+        p = props(obj)
+        if p.get("link.input.node") == dst:
+            out.append((obj.get("id"), p.get("link.input.port")))
+    return out
+
+
+def current_mic(objects: list[dict] | None = None) -> str | None:
+    objects = objects if objects is not None else dump()
+    inp = node_id(objects, SINK_NODE)
+    if inp is None:
+        return None
+    names = {obj.get("id"): props(obj).get("node.name") for obj in objects}
+    for obj in objects:
+        p = props(obj)
+        if p.get("link.input.node") == inp:
+            return names.get(p.get("link.output.node"))
+    return None
+
+
+def _mic_state_file() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "nvclean", "mic")
+
+
+def remember_mic(name: str) -> None:
+    """Guarda o microfone escolhido para reconectar após reinícios."""
+    try:
+        path = _mic_state_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(name + "\n")
+    except OSError:
+        pass
+
+
+def recalled_mic() -> str | None:
+    try:
+        with open(_mic_state_file(), encoding="utf-8") as fh:
+            name = fh.read().strip()
+        return name or None
+    except OSError:
+        return None
+
+
+def connect_mic(mic: str, *, remember: bool = True) -> None:
+    """Liga o microfone ao filtro.
+
+    Ordem segura: VALIDAR portas -> criar links -> só então remover os antigos
+    que não foram reaproveitados. Se qualquer passo falhar, o microfone
+    anterior continua funcionando (antes o código destruía antes de validar e
+    deixava o microfone virtual mudo).
+    """
+    objects = dump()
+    if not any(n == mic for n, _ in list_mics(objects)):
+        raise Fail(f"microfone '{mic}' não encontrado (use: nvclean-control mic)")
+
+    # Depois de reiniciar o PipeWire o dispositivo pode levar alguns instantes
+    # para expor as portas; espera até ~3 s antes de desistir.
+    import time
+
+    outs: list[dict] = []
+    ins: list[dict] = []
+    for _ in range(30):
+        objects = dump()
+        outs = ports(objects, mic, "output")
+        ins = ports(objects, SINK_NODE, "input")
+        if outs and ins:
+            break
+        time.sleep(0.1)
+
+    if not outs:
+        raise Fail(f"microfone '{mic}' não expõe portas de saída")
+    if not ins:
+        raise Fail(f"nó {SINK_NODE} não expõe portas de entrada")
+
+    # Mapeamento canal a canal. Casa por nome de canal (FL/FR, 1/2) em vez de
+    # índice, para não trocar canais em dispositivos com muitas portas.
+    def channel_key(name: str) -> str:
+        raw = (name or "").upper()
+        for tag in ("FL", "FR", "FC", "LFE", "MONO"):
+            if tag in raw:
+                return tag
+        # capture_1 / playback_2 -> sufixo numérico
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        return digits or raw
+
+    out_by_key = {channel_key(p.get("port.name")): p for p in outs}
+    for index, port_in in enumerate(ins):
+        key = channel_key(port_in.get("port.name"))
+        src_port = out_by_key.get(key)
+        if src_port is None:
+            # microfone com menos canais: replica o primeiro (mono -> L+R)
+            src_port = outs[index] if index < len(outs) else outs[0]
+        target = f"{SINK_NODE}:{port_in.get('port.name')}"
+        source = f"{mic}:{src_port.get('port.name')}"
+
+        # se este link já existe, não precisa recriar
+        already = False
+        for obj in objects:
+            p = props(obj)
+            if (p.get("link.input.node") == node_id(objects, SINK_NODE)
+                    and p.get("link.input.port") == port_in.get("object.id")):
+                already = True
+                break
+        if already:
+            continue
+
+        proc = _run(["pw-link", source, target])
+        if proc.returncode != 0:
+            raise Fail(
+                f"falha ao ligar {source} -> {target}: "
+                f"{proc.stderr.strip() or proc.returncode}"
+            )
+
+    # Só agora remove links antigos que entram no filtro e vêm de OUTRO nó
+    # (ex.: o microfone anterior). Os links recém-criados são preservados.
+    new_objects = dump()
+    sink_id = node_id(new_objects, SINK_NODE)
+    mic_id = node_id(new_objects, mic)
+    for obj in new_objects:
+        p = props(obj)
+        if p.get("link.input.node") != sink_id:
+            continue
+        if p.get("link.output.node") == mic_id:
+            continue
+        _run(["pw-cli", "destroy", str(obj.get("id"))])
+
+    # Só uma escolha explícita do usuário substitui o microfone salvo. O
+    # reconnect automático pode cair num microfone de fallback (ex.: o interno
+    # quando o USB foi desconectado por um instante) e não deve apagar a
+    # preferência do usuário.
+    if remember:
+        remember_mic(mic)
+
+
+def reconnect() -> str | None:
+    """Reconecta o microfone salvo (ou o padrão do sistema).
+
+    Usado depois de reiniciar o PipeWire, quando o link manual desaparece.
+    """
+    preferred = recalled_mic()
+    candidates: list[str] = []
+    if preferred:
+        candidates.append(preferred)
+
+    # completa com o microfone padrão e os demais, na ordem
+    try:
+        default = subprocess.run(
+            ["pactl", "get-default-source"], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        default = ""
+    if default:
+        candidates.append(default)
+    for name, _desc in list_mics():
+        candidates.append(name)
+
+    seen: set[str] = set()
+    for name in candidates:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        try:
+            connect_mic(name, remember=False)
+            return name
+        except Fail:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Nível
+# ---------------------------------------------------------------------------
+def level_stream(interval: float = 0.05) -> None:
+    """Emite o nível em dBFS continuamente, usando UM processo pw-cat.
+
+    Antes cada leitura criava um processo novo (~443 ms). Aqui o pw-cat fica
+    gravando e o script calcula um RMS por janela curta, imprimindo uma linha
+    por leitura. A GUI deixa de spawnar processos e passa a ler este stream.
+    """
+    import math
+    import struct
+
+    args = [
+        "pw-cat", "--record", "--target", SOURCE_NODE,
+        "--rate", "48000", "--channels", "2", "--format", "f32", "--raw", "-",
+    ]
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError as exc:
+        raise Fail("pw-cat não encontrado (instale pipewire)") from exc
+
+    if proc.stdout is None:
+        raise Fail("não foi possível ler a saída do pw-cat")
+
+    # 48 kHz × 2 canais × 4 bytes = 384000 B/s. A janela de 50 ms dá ~19 KB.
+    window_bytes = int(48000 * 2 * 4 * interval)
+    window_bytes -= window_bytes % (4 * 2)  # alinhar a frames estéreo f32
+
+    try:
+        print("ready", flush=True)  # sinaliza que o stream está pronto
+        while True:
+            chunk = proc.stdout.read(window_bytes)
+            if not chunk:
+                break
+            count = len(chunk) // 4
+            if count == 0:
+                continue
+            samples = struct.unpack(f"<{count}f", chunk[:count * 4])
+            acc = 0.0
+            for value in samples:
+                acc += value * value
+            rms = math.sqrt(acc / count)
+            db = 20.0 * math.log10(rms) if rms > 1e-9 else -100.0
+            print(f"{db:.1f}", flush=True)
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    finally:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _terminate_on_signal() -> None:
+    """SIGTERM/SIGHUP: encerra o pw-cat filho antes de sair.
+
+    Sem isso, ao fechar a GUI o `level-stream` morria e deixava o `pw-cat`
+    neto vivo até o próximo write falhar com SIGPIPE (não determinístico).
+    """
+    import signal
+
+    def handler(_signum, _frame):
+        raise SystemExit(0)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, handler)
+            except (OSError, ValueError):
+                pass
+
+
+def level() -> float | None:
+    """RMS atual da entrada, em dBFS. Lê ~0,3 s do microfone virtual."""
+    args = [
+        "pw-cat", "--record", "--target", SOURCE_NODE,
+        "--rate", "48000", "--channels", "2", "--format", "f32", "--raw", "-",
+    ]
+    try:
+        # pw-cat grava até ser morto; 0,35 s já dá ~67 KB, suficiente para RMS.
+        proc = subprocess.run(args, capture_output=True, timeout=0.35)
+        raw = proc.stdout or b""
+    except subprocess.TimeoutExpired as exc:
+        raw = exc.stdout or b""
+    except FileNotFoundError as exc:
+        raise Fail("pw-cat não encontrado (instale pipewire)") from exc
+
+    if len(raw) < 256:
+        return None
+    try:
+        import numpy as np
+
+        x = np.frombuffer(raw, dtype=np.float32).astype(np.float64)
+        rms = float(np.sqrt((x ** 2).mean()))
+        return 20.0 * math.log10(max(rms, 1e-9))
+    except ImportError as exc:
+        raise Fail("numpy é necessário para medir o nível") from exc
+
+
+# ---------------------------------------------------------------------------
+# Comandos
+# ---------------------------------------------------------------------------
+def cmd_status(as_json: bool, wait_for_mic: float = 0.0) -> int:
+    objects = dump()
+    sink = node_id(objects, SINK_NODE)
+    src = node_id(objects, SOURCE_NODE)
+    mix = get_mix(objects)
+    mic = current_mic(objects)
+
+    # O serviço nvclean-reconnect leva alguns segundos para refazer o link
+    # depois de um reinício do PipeWire. Essa espera é OPCIONAL: a GUI e os
+    # scripts de leitura precisam de resposta imediata, então o padrão é não
+    # bloquear. Use --wait (ou a varredura abaixo) só quando fizer sentido.
+    if sink is not None and src is not None and not mic and wait_for_mic:
+        import time
+
+        deadline = time.monotonic() + wait_for_mic
+        while time.monotonic() < deadline:
+            time.sleep(0.15)
+            objects = dump()
+            mic = current_mic(objects)
+            if mic:
+                break
+
+    # "Ligado" só é verdade se houver microfone de verdade entrando no filtro.
+    # Sem fonte, o microfone virtual fica mudo — isso é falha, não sucesso.
+    healthy = sink is not None and src is not None and mix is not None and bool(mic)
+    state = {
+        "available": sink is not None and src is not None and mix is not None,
+        # Abaixo do piso de intensidade útil (0.01) o filtro é bypass na
+        # prática: não anuncie "ligado" com a voz ainda crua.
+        "enabled": None if mix is None else mix > 0.01,
+        "intensity": mix,
+        "mic": mic,
+        "source_connected": bool(mic),
+        "nodes": {"input": sink, "output": src},
+    }
+    if as_json:
+        print(json.dumps(state, ensure_ascii=False))
+        return 0 if healthy else 3
+
+    if not state["available"]:
+        print("indisponível: nós nvclean não existem (rode setup-denoiser.sh)")
+        return 3
+    if not mic:
+        print("indisponível: nenhum microfone conectado — o microfone virtual")
+        print("             está mudo. Use: nvclean-control mic <nome>")
+        return 3
+    if state["enabled"]:
+        print(f"estado     : LIGADO (intensidade {mix:.2f})")
+    else:
+        print("estado     : DESLIGADO (bypass)")
+    print(f"microfone  : {mic}")
+    return 0
+
+
+def cmd_doctor() -> int:
+    objects = dump()
+    problems = 0
+    pending = False
+
+    def report(label: str, ok: bool, detail: str = "") -> None:
+        nonlocal problems
+        if not ok:
+            problems += 1
+        print(f"{label:<38} {'OK' if ok else 'FALHA'}{('  ' + detail) if detail else ''}")
+
+    sink = node_id(objects, SINK_NODE)
+    src = node_id(objects, SOURCE_NODE)
+    report(f"nó {SINK_NODE}", sink is not None)
+    report(f"nó {SOURCE_NODE}", src is not None)
+    mix = get_mix(objects)
+    report(f"parâmetro {PARAM}", mix is not None, "" if mix is None else f"= {mix:.2f}")
+    report("plugin LADSPA", os.path.isfile(PLUGIN), PLUGIN)
+    report("config do filter-chain", os.path.isfile(CONF), CONF)
+
+    mic = current_mic(objects)
+    # Sem microfone o nó virtual fica mudo. Isso é falha de instalação, não
+    # apenas um aviso: o app existe para filtrar o microfone.
+    report("microfone conectado", bool(mic), mic or "nenhum (use: mic <nome>)")
+
+    # Distingue "não instalado" de "instalado, mas o PipeWire ainda não releu
+    # a config". No segundo caso, reiniciar o PipeWire resolve — não é erro de
+    # instalação, e o instalador não deve abortar por isso.
+    if (sink is None or src is None) and os.path.isfile(PLUGIN) and os.path.isfile(CONF):
+        pending = True
+        print()
+        print("O filtro está instalado, mas o PipeWire ainda não carregou a config.")
+        print("Resolva com:  systemctl --user restart pipewire")
+        return 0 if problems <= 2 else 1
+
+    return 0 if problems == 0 else 1
+
+
+def cmd_mics() -> int:
+    mics = list_mics()
+    if not mics:
+        print("nenhum microfone encontrado")
+        return 1
+    active = current_mic()
+    for name, desc in mics:
+        mark = "*" if name == active else " "
+        print(f"{mark} {name}\t{desc}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="nvclean-control",
+        description="Controla o filtro de ruído de ENTRADA (microfone).",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="status",
+        choices=[
+            "on", "off", "toggle", "status", "intensity", "mic",
+            "mics", "level", "level-stream", "doctor", "reconnect",
+        ],
+    )
+    parser.add_argument("value", nargs="?")
+    parser.add_argument("--json", action="store_true", help="saída em JSON (status)")
+    parser.add_argument(
+        "--wait",
+        type=float,
+        nargs="?",
+        const=6.0,
+        default=0.0,
+        help="espera até N segundos pelo link do microfone (padrão: 0)",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command == "on":
+            # NÃO forçar 1.0: o usuário pode ter ajustado 0.6 e ligar/desligar
+            # não deve apagar esse ajuste. Só aplica 1.0 quando nunca houve
+            # ajuste salvo (primeiro uso).
+            value = recalled_intensity()
+            set_mix(value, remember=False)
+            print(f"filtro LIGADO (intensidade {value:.2f})")
+        elif args.command == "off":
+            set_mix(0.0, remember=False)
+            print("filtro DESLIGADO (bypass)")
+        elif args.command == "toggle":
+            mix = get_mix()
+            if mix is not None and mix > 0.0:
+                set_mix(0.0, remember=False)
+                print("filtro DESLIGADO (bypass)")
+            else:
+                # restaura a intensidade ajustada antes de desligar
+                value = recalled_intensity()
+                set_mix(value, remember=False)
+                print(f"filtro LIGADO (intensidade {value:.2f})")
+        elif args.command == "status":
+            return cmd_status(args.json, args.wait)
+        elif args.command == "intensity":
+            if args.value is None:
+                raise Fail("informe a intensidade (0.0 a 1.0)")
+            value = float(args.value)
+            if not 0.0 <= value <= 1.0:
+                raise Fail("intensidade deve estar entre 0 e 1")
+            # `NVCLEAN_REMEMBER=0` aplica sem memorizar: usado por testes e
+            # por automação que não deve alterar a preferência do usuário.
+            remember = os.environ.get("NVCLEAN_REMEMBER", "1") != "0"
+            set_mix(value, remember=remember)
+            if value <= 0.0:
+                print("intensidade = 0.00 (equivale a DESLIGADO: bypass)")
+            else:
+                print(f"intensidade = {value:.2f}")
+        elif args.command == "mic":
+            if not args.value:
+                return cmd_mics()
+            connect_mic(args.value)
+            print(f"microfone conectado: {args.value}")
+        elif args.command == "reconnect":
+            name = reconnect()
+            if name:
+                print(f"microfone reconectado: {name}")
+            else:
+                print("nenhum microfone pôde ser reconectado", file=sys.stderr)
+                return 3
+        elif args.command == "mics":
+            return cmd_mics()
+        elif args.command == "level":
+            value = level()
+            print("-inf" if value is None else f"{value:.1f}")
+        elif args.command == "level-stream":
+            _terminate_on_signal()
+            level_stream()
+        elif args.command == "doctor":
+            return cmd_doctor()
+    except Fail as exc:
+        print(f"nvclean-control: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"nvclean-control: valor inválido: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

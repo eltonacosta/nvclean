@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b2230"/>
+      <stop offset="1" stop-color="#0d1117"/>
+    </linearGradient>
+    <linearGradient id="mic" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9ee62b"/>
+      <stop offset="1" stop-color="#76b900"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <rect x="8.75" y="8.75" width="238.5" height="238.5" rx="55.25" fill="none" stroke="#2a3441" stroke-width="1.5"/>
+  <!-- corpo do microfone -->
+  <rect x="99" y="52" width="58" height="104" rx="29" fill="url(#mic)"/>
+  <!-- grade -->
+  <g stroke="#0d1117" stroke-width="4" opacity="0.35" stroke-linecap="round">
+    <line x1="108" y1="78" x2="148" y2="78"/>
+    <line x1="108" y1="96" x2="148" y2="96"/>
+    <line x1="108" y1="114" x2="148" y2="114"/>
+    <line x1="108" y1="132" x2="148" y2="132"/>
+  </g>
+  <!-- arco -->
+  <path d="M74 118v10c0 29.8 24.2 54 54 54s54-24.2 54-54v-10"
+        fill="none" stroke="#e6edf3" stroke-width="13" stroke-linecap="round"/>
+  <!-- haste e base -->
+  <line x1="128" y1="182" x2="128" y2="205" stroke="#e6edf3" stroke-width="13" stroke-linecap="round"/>
+  <line x1="96" y1="205" x2="160" y2="205" stroke="#e6edf3" stroke-width="13" stroke-linecap="round"/>
+  <!-- corte de ruído: riscos saindo dos lados -->
+  <g stroke="#76b900" stroke-width="6" stroke-linecap="round" opacity="0.85">
+    <line x1="46" y1="86" x2="64" y2="86"/>
+    <line x1="38" y1="110" x2="60" y2="110"/>
+    <line x1="46" y1="134" x2="64" y2="134"/>
+    <line x1="210" y1="86" x2="192" y2="86"/>
+    <line x1="218" y1="110" x2="196" y2="110"/>
+    <line x1="210" y1="134" x2="192" y2="134"/>
+  </g>
+</svg>

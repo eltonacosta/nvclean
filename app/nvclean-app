@@ -1,0 +1,1563 @@
+#!/usr/bin/env python3
+"""nvclean — app de bandeja para o filtro de ruído de ENTRADA (microfone).
+
+Equivalente Linux do essencial do NVIDIA Broadcast: um interruptor para o
+limpador de voz do microfone, seleção do microfone de origem, intensidade do
+efeito e um medidor de nível.
+
+ESCOPO — só ENTRADA. O app controla exclusivamente os nós "nvclean.input" /
+"nvclean". A saída de áudio do sistema (alto-falantes/fones) e o boost 3x do
+usuário não são tocados.
+
+DESEMPENHO — nada de subprocesso na thread do GTK. Leitura de estado, troca de
+microfone, toggle e intensidade rodam em threads de trabalho; o medidor lê um
+stream contínuo de pw-cat em vez de criar um processo por amostra.
+
+Uso:
+  nvclean-app                abre a janela
+  nvclean-app --hidden       só na bandeja (útil no autostart)
+  nvclean-app --toggle       alterna e sai (para atalho de teclado)
+  nvclean-app --check        verifica dependências e estado
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+
+APP_ID = "nvclean"
+VERSION = "1.2.0"
+HERE = os.path.dirname(os.path.abspath(__file__))
+_CANDIDATES = [
+    os.environ.get("NVCLEAN_CONTROL", ""),
+    os.path.join(HERE, "nvclean-control"),
+    os.path.join(HERE, "..", "scripts", "linux", "nvclean-control"),
+    os.path.expanduser("~/.local/bin/nvclean-control"),
+]
+CONTROL = next(
+    (os.path.abspath(p) for p in _CANDIDATES if p and os.path.isfile(os.path.abspath(p))),
+    os.path.join(HERE, "nvclean-control"),
+)
+
+BG = "#0d1117"
+CARD = "#161b22"
+CARD_HOVER = "#1f2631"
+BORDER = "#2a3441"
+TEXT = "#e6edf3"
+MUTED = "#8b949e"
+ACCENT = "#76b900"
+ACCENT_DARK = "#5a8f00"
+DANGER = "#d93f3f"
+
+# O card tem raio 12px. O switch precisa de margem interna suficiente para o
+# knob (círculo branco) não ser cortado pela borda arredondada.
+CARD_RADIUS = 12
+CARD_PAD = 18
+
+
+def control(*args: str) -> tuple[int, str]:
+    """Executa o controlador e devolve (código, saída). Bloqueia o chamador."""
+    if not os.path.isfile(CONTROL):
+        return 1, f"controlador não encontrado: {CONTROL}"
+    cmd = [CONTROL, *args] if os.access(CONTROL, os.X_OK) else [sys.executable, CONTROL, *args]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=20,
+        )
+        return proc.returncode, (proc.stdout or proc.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 1, "timeout"
+    except OSError as exc:
+        return 1, f"falha ao executar {CONTROL}: {exc}"
+
+
+def control_json(*args: str) -> dict:
+    """Lê um payload JSON do controlador.
+
+    O `status --json` usa o código de saída para indicar saúde: 0 = tudo ok,
+    3 = filtro/nó sem microfone conectado. O corpo JSON vem completo nos dois
+    casos, então o código NÃO pode ser tratado como "sem payload" — era o que
+    matava o caminho de reconexão justamente quando o microfone caía.
+    """
+    code, out = control(*args, "--json")
+    if code not in (0, 3):
+        return {}
+    # `control` devolve stdout ou stderr; descarta linhas de aviso antes do JSON.
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                return {}
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Configurações persistentes (~/.config/nvclean/settings.json)
+# ---------------------------------------------------------------------------
+SETTINGS_DIR = os.path.expanduser("~/.config/nvclean")
+SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
+AUTOSTART_PATH = os.path.expanduser("~/.config/autostart/nvclean.desktop")
+
+DEFAULT_SETTINGS = {
+    "start_with_system": False,
+    "stay_in_background": True,
+}
+
+AUTOSTART_ENTRY = """[Desktop Entry]
+Type=Application
+Name=nvclean
+GenericName=Limpador de voz do microfone
+Comment=Remove ruído do microfone e expõe o microfone virtual "nvclean"
+Exec={exec_path} --hidden
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=microphone;noise;ruido;denoise;nvclean;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+"""
+
+
+def load_settings() -> dict:
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return settings
+    if isinstance(data, dict):
+        for key in DEFAULT_SETTINGS:
+            if isinstance(data.get(key), bool):
+                settings[key] = data[key]
+    return settings
+
+
+def save_settings(settings: dict) -> bool:
+    """Grava as preferências de forma atômica (tmp + rename)."""
+    try:
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, SETTINGS_PATH)
+        return True
+    except OSError:
+        return False
+
+
+def _desktop_exec_quote(path: str) -> str:
+    """Escapa um argumento Exec= conforme a especificação Desktop Entry.
+
+    Duas camadas de parser:
+    1. GKeyFile lê o valor: só entende `\\s \\t \\n \\r \\\\`.
+    2. Exec= divide o comando: dentro de aspas duplas, `"`, `` ` ``, `$` e
+       `\\` precisam de barra invertida.
+
+    Comportamento verificado no GIO desta máquina: espaço e `%` ficam
+    literais (`%%` é REJEITADO); aspas pedem duas barras no arquivo; `$` e
+    `` ` `` chegam ao argv com a barra intacta (limitação do GIO). Por isso
+    `apply_autostart` valida o argv resultante e não publica um entry cujo
+    Exec não aponte para o binário real.
+    """
+    escaped = path.replace("\\", "\\\\").replace('"', '\\\\"')
+    escaped = escaped.replace("`", "\\`").replace("$", "\\$")
+    return f'"{escaped}"'
+
+
+def apply_autostart(enabled: bool) -> bool:
+    """Cria/remove o .desktop de autostart. Devolve True se o disco bateu."""
+    try:
+        if enabled:
+            os.makedirs(os.path.dirname(AUTOSTART_PATH), exist_ok=True)
+            exec_path = shutil.which("nvclean-app") or os.path.abspath(sys.argv[0])
+            if "%" in exec_path:
+                # O GIO expande `%` do Exec como field code (`%20` vira "0") e
+                # rejeita `%%`. Não existe forma válida para esse caminho, então
+                # é melhor recusar do que publicar um autostart que não abre.
+                return False
+            tmp = AUTOSTART_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(AUTOSTART_ENTRY.format(exec_path=_desktop_exec_quote(exec_path)))
+            # Valida antes de publicar: um Entry inválido (ou cujo Exec não
+            # aponta para o binário) não inicia nada no login.
+            if not _desktop_entry_valid(tmp, exec_path):
+                os.remove(tmp)
+                return False
+            os.replace(tmp, AUTOSTART_PATH)
+        elif os.path.exists(AUTOSTART_PATH):
+            os.remove(AUTOSTART_PATH)
+        return True
+    except OSError:
+        return False
+
+
+def _desktop_entry_valid(path: str, expected_exec: str) -> bool:
+    """Confere se o .desktop é aceito E se o Exec aponta para o binário real."""
+    try:
+        from gi.repository import Gio
+
+        info = Gio.DesktopAppInfo.new_from_filename(path)
+        if info is None:
+            return False
+        # Comparação exata do executável; `in` dava falso positivo para
+        # ".../nvclean-app.wrapper" e não detectava `%20` virando `0`.
+        # get_executable() devolve o token como está no Exec, com aspas.
+        executable = (info.get_executable() or "").strip().strip('"')
+        return os.path.realpath(executable) == os.path.realpath(expected_exec)
+    except Exception:
+        return False
+
+
+def autostart_installed() -> bool:
+    return os.path.exists(AUTOSTART_PATH)
+
+
+def main(argv: list[str]) -> int:
+    if "--toggle" in argv:
+        code, out = control("toggle")
+        print(out)
+        return code
+
+    try:
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        from gi.repository import Gdk, GLib, GObject, Gtk
+    except (ImportError, ValueError) as exc:
+        print(
+            "nvclean: PyGObject/GTK 3 não encontrado.\n"
+            "Instale: sudo pacman -S python-gobject gtk3  (Arch)\n"
+            f"Detalhe: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
+    class IntSlider(Gtk.DrawingArea):
+        """Slider de intensidade com o knob exatamente sob o cursor.
+
+        O Gtk.Scale nativo posiciona o knob pela caixa do gadget do tema e o
+        warp do clique é calculado como uma média entre as bordas do knob
+        (gtkrange.c: coord_to_value + gtk_range_compute_slider_position).
+        Com um knob maior que o padrão isso desloca o desenho para a direita
+        do clique — a queixa do usuário. Aqui o mapeamento é direto:
+        centro do knob == posição do cursor, sem folga.
+        """
+
+        __gsignals__ = {
+            "value-changed": (GObject.SignalFlags.RUN_FIRST, None, (float,)),
+        }
+
+        PAD = 12  # raio do knob + folga, para o círculo não ser cortado
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._value = 1.0
+            self._dragging = False
+            self.set_size_request(-1, 30)
+            self.set_can_focus(True)
+            self.add_events(
+                Gdk.EventMask.BUTTON_PRESS_MASK
+                | Gdk.EventMask.BUTTON_RELEASE_MASK
+                | Gdk.EventMask.POINTER_MOTION_MASK
+                | Gdk.EventMask.KEY_PRESS_MASK
+            )
+            self.connect("draw", self._on_draw)
+            self.connect("button-press-event", self._on_press)
+            self.connect("button-release-event", self._on_release)
+            self.connect("motion-notify-event", self._on_motion)
+            self.connect("key-press-event", self._on_key)
+
+        # -- API ---------------------------------------------------------
+        def get_value(self) -> float:
+            return self._value
+
+        def set_value(self, value: float) -> None:
+            value = max(0.0, min(1.0, float(value)))
+            if abs(value - self._value) < 1e-9:
+                self._value = value
+                self.queue_draw()
+                return
+            self._value = value
+            self.queue_draw()
+            self.emit("value-changed", value)
+
+        # -- geometria ---------------------------------------------------
+        def _track(self) -> tuple[float, float]:
+            width = self.get_allocated_width()
+            return self.PAD, max(self.PAD, width - self.PAD)
+
+        def _value_at(self, x: float) -> float:
+            left, right = self._track()
+            if right <= left:
+                return self._value
+            return max(0.0, min(1.0, (x - left) / (right - left)))
+
+        # -- desenho -----------------------------------------------------
+        def _on_draw(self, _widget, cr) -> bool:
+            width = self.get_allocated_width()
+            height = self.get_allocated_height()
+            left, right = self._track()
+            cy = height / 2.0
+            knob_x = left + self._value * (right - left)
+
+            cr.set_line_cap(1)  # cairo.LINE_CAP_ROUND
+            # trilho
+            cr.set_source_rgb(0x2a / 255, 0x34 / 255, 0x41 / 255)
+            cr.set_line_width(5)
+            cr.move_to(left, cy)
+            cr.line_to(right, cy)
+            cr.stroke()
+            # parte ativa
+            cr.set_source_rgb(0x76 / 255, 0xb9 / 255, 0x00 / 255)
+            cr.move_to(left, cy)
+            cr.line_to(knob_x, cy)
+            cr.stroke()
+            # knob: anel branco + miolo verde, centrado no valor
+            cr.set_source_rgb(1, 1, 1)
+            cr.arc(knob_x, cy, 9, 0, 2 * 3.141592653589793)
+            cr.fill()
+            cr.set_source_rgb(0x76 / 255, 0xb9 / 255, 0x00 / 255)
+            cr.arc(knob_x, cy, 6, 0, 2 * 3.141592653589793)
+            cr.fill()
+            return False
+
+        # -- interação ---------------------------------------------------
+        def _on_press(self, widget, event) -> bool:
+            if event.button != 1:
+                return False
+            self._dragging = True
+            self.grab_focus()
+            self.set_value(self._value_at(event.x))
+            return True
+
+        def _on_release(self, _widget, event) -> bool:
+            if event.button == 1:
+                self._dragging = False
+            return False
+
+        def _on_motion(self, _widget, event) -> bool:
+            if self._dragging and event.state & Gdk.ModifierType.BUTTON1_MASK:
+                self.set_value(self._value_at(event.x))
+                return True
+            return False
+
+        def _on_key(self, _widget, event) -> bool:
+            step = 0.05
+            if event.keyval in (Gdk.KEY_Left, Gdk.KEY_Down):
+                self.set_value(self._value - step)
+                return True
+            if event.keyval in (Gdk.KEY_Right, Gdk.KEY_Up):
+                self.set_value(self._value + step)
+                return True
+            return False
+
+    if "--check" in argv:
+        code, out = control("doctor")
+        print(out)
+        return code
+
+    hidden = "--hidden" in argv
+
+    # -----------------------------------------------------------------
+    # Bandeja: StatusNotifierItem + DBusMenu (o que GNOME/KDE usam hoje).
+    #
+    # Gtk.StatusIcon é XEmbed e não aparece no Wayland (o GNOME nem cria o
+    # ícone: is_embedded=False). Por isso o caminho principal é SNI; o
+    # StatusIcon fica só como fallback para X11 sem SNI.
+    # -----------------------------------------------------------------
+    SNI_INTERFACE = """
+    <node>
+      <interface name="org.kde.StatusNotifierItem">
+        <property name="Category" type="s" access="read"/>
+        <property name="Id" type="s" access="read"/>
+        <property name="Title" type="s" access="read"/>
+        <property name="Status" type="s" access="read"/>
+        <property name="WindowId" type="i" access="read"/>
+        <property name="IconThemePath" type="s" access="read"/>
+        <property name="Menu" type="o" access="read"/>
+        <property name="ItemIsMenu" type="b" access="read"/>
+        <property name="IconName" type="s" access="read"/>
+        <property name="OverlayIconName" type="s" access="read"/>
+        <property name="AttentionIconName" type="s" access="read"/>
+        <property name="AttentionMovieName" type="s" access="read"/>
+        <method name="ContextMenu">
+          <arg name="x" type="i" direction="in"/>
+          <arg name="y" type="i" direction="in"/>
+        </method>
+        <method name="Activate">
+          <arg name="x" type="i" direction="in"/>
+          <arg name="y" type="i" direction="in"/>
+        </method>
+        <method name="ProvideXdgActivationToken">
+          <arg name="token" type="s" direction="in"/>
+        </method>
+        <method name="SecondaryActivate">
+          <arg name="x" type="i" direction="in"/>
+          <arg name="y" type="i" direction="in"/>
+        </method>
+        <method name="XAyatanaSecondaryActivate">
+          <arg name="timestamp" type="u" direction="in"/>
+        </method>
+        <method name="Scroll">
+          <arg name="delta" type="i" direction="in"/>
+          <arg name="orientation" type="s" direction="in"/>
+        </method>
+        <signal name="NewStatus">
+          <arg name="status" type="s"/>
+        </signal>
+        <signal name="NewIcon"/>
+        <signal name="NewToolTip"/>
+      </interface>
+    </node>
+    """
+
+    class SystemTray:
+        """Ícone de bandeja com menu Abrir / Configurações / Sair.
+
+        Prioriza StatusNotifierItem (Wayland, GNOME, KDE). Se não houver
+        watcher nem D-Bus, cai para Gtk.StatusIcon (X11/XEmbed).
+        """
+
+        MENU_PATH = "/org/nvclean/Menu"
+        SNI_PATH = "/StatusNotifierItem"
+        BUS_NAME = "org.nvclean.App"
+
+        def __init__(self, app, icon_name: str) -> None:
+            self.app = app
+            self.icon_name = icon_name
+            self._conn = None
+            self._sni = None
+            self._dbusmenu = None
+            self._status_icon = None
+            self._toggle_item = None
+            self._last_click = 0.0
+            self.available = False
+
+        # -- construção -------------------------------------------------
+        def build(self) -> bool:
+            self.error = ""
+            if self._build_sni():
+                self.available = True
+                self.update_state(self.app.enabled)
+                return True
+            self._build_status_icon()
+            icon_ok = False
+            if self._status_icon is not None:
+                try:
+                    # No Wayland o XEmbed não é exibido: is_embedded fica False
+                    # e não há ícone nenhum. Melhor saber agora para avisar.
+                    icon_ok = bool(self._status_icon.is_embedded())
+                except Exception:
+                    icon_ok = True
+            self.available = icon_ok
+            return self.available
+
+        def _build_menu(self) -> None:
+            """Cria o menu D-Bus (libdbusmenu-glib)."""
+            gi_menu = __import__("gi")
+            gi_menu.require_version("Dbusmenu", "0.4")
+            from gi.repository import Dbusmenu
+
+            root = Dbusmenu.Menuitem.new()
+
+            toggle = Dbusmenu.Menuitem.new()
+            toggle.property_set(Dbusmenu.MENUITEM_PROP_LABEL, "Cancelamento de ruído")
+            toggle.property_set(Dbusmenu.MENUITEM_PROP_TOGGLE_TYPE, "checkmark")
+            toggle.property_set_int(Dbusmenu.MENUITEM_PROP_TOGGLE_STATE,
+                                    1 if self.app.enabled else 0)
+            toggle.connect("item-activated", self._on_toggle_activated)
+            root.child_append(toggle)
+            self._toggle_item = toggle
+
+            sep = Dbusmenu.Menuitem.new()
+            sep.property_set(Dbusmenu.MENUITEM_PROP_TYPE, "separator")
+            root.child_append(sep)
+
+            for label, handler in (
+                ("Abrir", lambda *_: self.app.show_window()),
+                ("Configurações", lambda *_: self.app.open_settings()),
+            ):
+                item = Dbusmenu.Menuitem.new()
+                item.property_set(Dbusmenu.MENUITEM_PROP_LABEL, label)
+                item.connect("item-activated", self._make_handler(handler))
+                root.child_append(item)
+
+            sep2 = Dbusmenu.Menuitem.new()
+            sep2.property_set(Dbusmenu.MENUITEM_PROP_TYPE, "separator")
+            root.child_append(sep2)
+
+            quit_item = Dbusmenu.Menuitem.new()
+            quit_item.property_set(Dbusmenu.MENUITEM_PROP_LABEL, "Sair (fechar de vez)")
+            quit_item.connect("item-activated", self._make_handler(lambda *_: self.app.quit()))
+            root.child_append(quit_item)
+
+            server = Dbusmenu.Server.new(self.MENU_PATH)
+            server.set_root(root)
+            self._dbusmenu = (server, root)
+
+        @staticmethod
+        def _make_handler(fn):
+            from gi.repository import Dbusmenu
+
+            def handler(_item, _timestamp):
+                fn()
+                return Dbusmenu.MENUITEM_EVENT_ACTIVATED
+
+            return handler
+
+        def _on_toggle_activated(self, _item, _timestamp):
+            from gi.repository import Dbusmenu
+
+            # Não confia no cache local: o filtro pode ter sido alterado por
+            # fora (CLI, atalho, outro app). O controlador lê o mix real e
+            # alterna a partir dele; o refresh corrige o desenho do check.
+            self.app.toggle_from_tray(None)
+            return Dbusmenu.MENUITEM_EVENT_ACTIVATED
+
+        def _build_sni(self) -> bool:
+            try:
+                from gi.repository import Gio, GLib
+            except ImportError:
+                return False
+
+            try:
+                conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            except GLib.Error:
+                return False
+            if conn is None:
+                return False
+
+            try:
+                self._build_menu()
+            except (ImportError, ValueError) as exc:
+                # libdbusmenu-glib ausente: gi.require_version levanta
+                # ValueError, não ImportError. Sem menu não há SNI útil; o
+                # motivo fica visível no aviso de "sem bandeja".
+                self.error = f"menu da bandeja indisponível ({exc})"
+                return False
+            except Exception:
+                self.error = "falha ao montar o menu da bandeja"
+                return False
+
+            try:
+                node = Gio.DBusNodeInfo.new_for_xml(SNI_INTERFACE).interfaces[0]
+            except GLib.Error:
+                return False
+
+            properties = {
+                "Category": GLib.Variant("s", "ApplicationStatus"),
+                "Id": GLib.Variant("s", "nvclean"),
+                "Title": GLib.Variant("s", "nvclean — microfone"),
+                "Status": GLib.Variant("s", "Active"),
+                "WindowId": GLib.Variant("i", 0),
+                "IconThemePath": GLib.Variant("s", ""),
+                "Menu": GLib.Variant("o", self.MENU_PATH),
+                # ItemIsMenu=False: clique simples abre a janela (Activate) e o
+                # menu abre no botão direito. Com True o clique simples abriria
+                # o menu, e o duplo clique não teria como abrir a janela.
+                "ItemIsMenu": GLib.Variant("b", False),
+                "IconName": GLib.Variant("s", self.icon_name),
+                "OverlayIconName": GLib.Variant("s", ""),
+                "AttentionIconName": GLib.Variant("s", ""),
+                "AttentionMovieName": GLib.Variant("s", ""),
+            }
+
+            def on_method(_conn, _sender, _path, _iface, method, _params, invocation):
+                if method in ("Activate", "SecondaryActivate"):
+                    GLib.idle_add(self.app.show_window)
+                elif method == "ContextMenu":
+                    GLib.idle_add(self.app.show_window)
+                invocation.return_value(None)
+
+            def on_get(_conn, _sender, _path, _iface, prop):
+                return properties.get(prop)
+
+            try:
+                self._sni = conn.register_object(
+                    self.SNI_PATH, node, on_method, on_get, None
+                )
+            except (GLib.Error, TypeError):
+                return False
+            if not self._sni:
+                return False
+
+            try:
+                Gio.bus_own_name_on_connection(
+                    conn, self.BUS_NAME, Gio.BusNameOwnerFlags.NONE, None, None
+                )
+            except GLib.Error:
+                pass
+
+            self._conn = conn
+            # O host da bandeja pode ainda não existir quando o app sobe no
+            # login (corrida com o shell). Tenta algumas vezes, em vez de
+            # registrar uma única vez e perder o ícone da sessão inteira.
+            self._register_attempts = 0
+            GLib.timeout_add(300, self._register_with_watcher)
+            return True
+
+        def _register_with_watcher(self) -> bool:
+            from gi.repository import Gio, GLib
+
+            self._register_attempts = getattr(self, "_register_attempts", 0) + 1
+            for service in (self.BUS_NAME, self.SNI_PATH):
+                try:
+                    self._conn.call_sync(
+                        "org.kde.StatusNotifierWatcher",
+                        "/StatusNotifierWatcher",
+                        "org.kde.StatusNotifierWatcher",
+                        "RegisterStatusNotifierItem",
+                        GLib.Variant("(s)", (service,)),
+                        None,
+                        Gio.DBusCallFlags.NONE,
+                        1500,
+                        None,
+                    )
+                    self.registered = True
+                    return False
+                except GLib.Error:
+                    continue
+            # 19 tentativas × 300 ms ≈ 6 s. Sem watcher
+            # (GNOME puro, sem a extensão AppIndicator) o ícone nunca aparece:
+            # nesse caso o app precisa se declarar sem bandeja para a janela
+            # não ficar invisível no autostart.
+            if self._register_attempts >= 19:
+                self.registered = False
+                self.available = False
+                self.error = "nenhum host de bandeja (StatusNotifierWatcher) na sessão"
+                self.app.on_tray_unavailable()
+                return False
+            return True
+
+        def is_registered(self) -> bool:
+            return bool(getattr(self, "registered", False))
+
+        def _build_status_icon(self) -> None:
+            try:
+                from gi.repository import Gtk
+
+                icon = Gtk.StatusIcon()
+                icon.set_from_icon_name(self.icon_name)
+                icon.set_tooltip_text("nvclean — microfone")
+                icon.connect("activate", self._on_status_activate)
+                icon.connect("popup-menu", self._on_status_menu)
+                icon.set_visible(True)
+                self._status_icon = icon
+            except Exception:
+                self._status_icon = None
+
+        # -- eventos do fallback X11 -------------------------------------
+        def _on_status_activate(self, _icon) -> None:
+            """Duplo clique abre a janela; clique simples alterna a visibilidade."""
+            import time
+
+            now = time.monotonic()
+            if now - self._last_click < 0.45:
+                self._last_click = 0.0
+                self.app.show_window()
+                return
+            self._last_click = now
+            self.app.toggle_window()
+
+        def _on_status_menu(self, icon, button, time) -> None:
+            from gi.repository import Gtk
+
+            menu = Gtk.Menu()
+            toggle = Gtk.CheckMenuItem(label="Cancelamento de ruído")
+            toggle.set_active(self.app.enabled)
+            toggle.connect("toggled", lambda w: self.app.toggle_from_tray(w.get_active()))
+            menu.append(toggle)
+            menu.append(Gtk.SeparatorMenuItem())
+            open_item = Gtk.MenuItem(label="Abrir")
+            open_item.connect("activate", lambda *_: self.app.show_window())
+            menu.append(open_item)
+            settings_item = Gtk.MenuItem(label="Configurações")
+            settings_item.connect("activate", lambda *_: self.app.open_settings())
+            menu.append(settings_item)
+            menu.append(Gtk.SeparatorMenuItem())
+            quit_item = Gtk.MenuItem(label="Sair (fechar de vez)")
+            quit_item.connect("activate", lambda *_: self.app.quit())
+            menu.append(quit_item)
+            menu.show_all()
+            menu.popup(None, None, None, None, button, time)
+
+        # -- atualização de estado --------------------------------------
+        def update_state(self, enabled: bool) -> None:
+            if self._toggle_item is not None:
+                try:
+                    from gi.repository import Dbusmenu
+
+                    self._toggle_item.property_set_int(
+                        Dbusmenu.MENUITEM_PROP_TOGGLE_STATE, 1 if enabled else 0
+                    )
+                except Exception:
+                    pass
+            if self._status_icon is not None:
+                try:
+                    self._status_icon.set_tooltip_text(
+                        "nvclean — " + ("ligado" if enabled else "desligado")
+                    )
+                except Exception:
+                    pass
+
+
+    class App:
+        def __init__(self) -> None:
+            self.enabled = False
+            self.intensity = 1.0
+            self.available = False
+            self.mic = ""
+            self.mics: list[tuple[str, str]] = []
+
+            # estado de concorrência
+            self._syncing = False
+            self._refresh_inflight = False
+            self._refresh_pending = False
+            self._toggle_seq = 0          # última intenção de ligar/desligar
+            self._toggle_inflight = 0     # toggles enviados e ainda sem resposta
+            self._intensity_timer: int | None = None
+            self._pending_intensity: float | None = None
+            self._level_stream: subprocess.Popen | None = None
+            self._level_thread: threading.Thread | None = None
+            self._closing = False
+            self._last_level = -100.0
+            self._settings_win: Gtk.Window | None = None
+            self.tray = None
+            self._no_tray_notice = ""
+            self._sticky_hint = ""
+
+            self.settings = load_settings()
+
+            self.window = Gtk.Window(title="nvclean — microfone")
+            self.window.set_default_size(420, 620)
+            self.window.set_resizable(False)
+            self.window.set_border_width(0)
+            self.window.connect("delete-event", self._on_close)
+            self.window.connect("destroy", lambda *_: self.quit())
+
+            self._build_ui()
+            self._build_tray()
+            self.refresh_async()
+            self._start_level_stream()
+
+            if hidden and not self.tray:
+                # Sem bandeja e escondido o app ficaria inalcançável (só
+                # matando o processo). Nesse caso mostra a janela e explica.
+                # O texto é aplicado depois do primeiro refresh, que limpa o
+                # hint quando o filtro está saudável (senão sumia em ~100 ms).
+                self._no_tray_notice = (
+                    "Sem bandeja neste ambiente"
+                    + (f" ({self.tray_controller.error})" if self.tray_controller and self.tray_controller.error else " (SNI indisponível)")
+                    + ". A janela fica aberta; use Configurações para sair."
+                )
+                self.hint.set_text(self._no_tray_notice)
+                self.window.show_all()
+
+            if not hidden:
+                self.window.show_all()
+
+        # ---------------------------------------------------------------- UI
+        def _build_ui(self) -> None:
+            css = f"""
+            window {{ background: {BG}; }}
+            label {{ color: {TEXT}; }}
+            .title {{ font-size: 20px; font-weight: 700; }}
+            .subtitle {{ color: {MUTED}; font-size: 11px; }}
+            .section {{ color: {MUTED}; font-size: 10px; font-weight: 700; letter-spacing: 1px; }}
+            .state-on {{ color: {ACCENT}; font-size: 13px; font-weight: 600; }}
+            .state-off {{ color: {MUTED}; font-size: 13px; font-weight: 600; }}
+
+            /* O padding do card garante que o knob do switch (que ultrapassa
+               a altura do widget) nunca encoste na borda arredondada. */
+            .card {{
+                background: {CARD};
+                border: 1px solid {BORDER};
+                border-radius: {CARD_RADIUS}px;
+                padding: {CARD_PAD}px;
+            }}
+            .card label {{ padding: 0; }}
+
+            /* No GTK3 desta distro o switch é desenhado pelo próprio nó
+               (não há nó 'trough' separado). Pintar 'trough' deixava o widget
+               sem trilho. O caminho correto aqui é pintar o switch e o estado
+               :checked, como o tema já faz. */
+            switch {{
+                background-color: {BORDER};
+                border: 1px solid #3a4757;
+                border-radius: 14px;
+                min-width: 52px;
+                min-height: 26px;
+            }}
+            switch:checked {{
+                background-color: {ACCENT};
+                border-color: {ACCENT};
+            }}
+            /* Não definir min-width/min-height aqui: o GTK calcula o passo do
+               knob com o tamanho do tema; forçar tamanho maior pelo CSS faz o
+               desenho crescer sem o layout acompanhar (knob fora do trilho). */
+            switch slider {{
+                background-color: #ffffff;
+                border: 1px solid #c9d1d9;
+                border-radius: 99px;
+            }}
+
+            levelbar trough {{ background: {BORDER}; border-radius: 5px; min-height: 10px; }}
+            levelbar block {{ background: {ACCENT}; border-radius: 5px; }}
+            levelbar block.empty {{ background: {BORDER}; border-radius: 5px; }}
+
+            /* O slider de intensidade é um Gtk.DrawingArea próprio (IntSlider):
+               o Gtk.Scale nativo erra o alinhamento do knob com temas que
+               mudam o tamanho do gadget. Não há CSS de scale aqui de propósito. */
+
+            combobox button {{
+                background: {CARD};
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                border-radius: 8px;
+                padding: 10px 12px;
+                margin: 0;
+            }}
+            checkbutton {{ color: {TEXT}; }}
+            checkbutton check {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 5px; }}
+            checkbutton check:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+            button.flat {{ background: transparent; color: {MUTED}; border: none; padding: 6px 10px; }}
+            button.flat:hover {{ color: {TEXT}; }}
+            """
+            provider = Gtk.CssProvider()
+            provider.load_from_data(css.encode("utf-8"))
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            self.window.add(root)
+
+            # cabeçalho
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            head.set_border_width(20)
+            icon = Gtk.Image.new_from_icon_name("audio-input-microphone", Gtk.IconSize.DIALOG)
+            head.pack_start(icon, False, False, 0)
+            titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            t = Gtk.Label(label="nvclean", xalign=0)
+            t.get_style_context().add_class("title")
+            s = Gtk.Label(label="Limpador de voz do microfone", xalign=0)
+            s.get_style_context().add_class("subtitle")
+            titles.pack_start(t, False, False, 0)
+            titles.pack_start(s, False, False, 0)
+            head.pack_start(titles, True, True, 0)
+            root.pack_start(head, False, False, 0)
+
+            wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            wrap.set_border_width(20)
+            wrap.set_margin_bottom(4)
+
+            # cartão principal (toggle)
+            card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+            card.get_style_context().add_class("card")
+
+            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            self.title_label = Gtk.Label(label="Cancelamento de ruído", xalign=0)
+            self.title_label.get_style_context().add_class("state-on")
+            self.state_label = Gtk.Label(label="desligado", xalign=0)
+            self.state_label.get_style_context().add_class("state-off")
+            left.pack_start(self.title_label, False, False, 0)
+            left.pack_start(self.state_label, False, False, 0)
+
+            self.switch = Gtk.Switch()
+            self.switch.set_valign(Gtk.Align.CENTER)
+            self.switch.set_halign(Gtk.Align.END)
+            self.switch.connect("state-set", self._on_toggle)
+            card.pack_start(left, True, True, 0)
+            card.pack_end(self.switch, False, False, 0)
+            wrap.pack_start(card, False, False, 0)
+
+            # seção microfone
+            mic_title = Gtk.Label(label="MICROFONE", xalign=0)
+            mic_title.get_style_context().add_class("section")
+            wrap.pack_start(mic_title, False, False, 2)
+
+            self.mic_combo = Gtk.ComboBoxText()
+            # Descrições longas (ex.: "HyperX QuadCast ...") fazem o tamanho
+            # natural do combo crescer e esticar a janela, mesmo com
+            # set_resizable(False): isso só bloqueia o redimensionamento pelo
+            # usuário, não a negociação de tamanho do GTK. Ellipsize + largura
+            # máxima mantêm a janela em 420 px.
+            for _cell in self.mic_combo.get_cells():
+                _cell.set_property("ellipsize", 3)  # Pango.EllipsizeMode.END
+                _cell.set_property("max-width-chars", 34)
+            self.mic_combo.set_size_request(320, -1)
+            self.mic_combo.connect("changed", self._on_mic_changed)
+            wrap.pack_start(self.mic_combo, False, False, 0)
+
+            # intensidade
+            int_title = Gtk.Label(label="INTENSIDADE DO FILTRO", xalign=0)
+            int_title.get_style_context().add_class("section")
+            wrap.pack_start(int_title, False, False, 2)
+
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            self.intensity_scale = IntSlider()
+            self.intensity_scale.connect("value-changed", self._on_intensity)
+            self.intensity_value = Gtk.Label(label="100%", xalign=1)
+            self.intensity_value.set_width_chars(5)
+            row.pack_start(self.intensity_scale, True, True, 0)
+            row.pack_start(self.intensity_value, False, False, 0)
+            wrap.pack_start(row, False, False, 0)
+
+            # medidor
+            lvl_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            lvl_title = Gtk.Label(label="NÍVEL DE ENTRADA", xalign=0)
+            lvl_title.get_style_context().add_class("section")
+            self.level_value = Gtk.Label(label="—", xalign=1)
+            self.level_value.get_style_context().add_class("subtitle")
+            self.level_value.set_width_chars(7)
+            lvl_row.pack_start(lvl_title, True, True, 0)
+            lvl_row.pack_end(self.level_value, False, False, 0)
+            wrap.pack_start(lvl_row, False, False, 2)
+
+            self.level_bar = Gtk.LevelBar()
+            self.level_bar.set_min_value(0.0)
+            self.level_bar.set_max_value(1.0)
+            self.level_bar.set_value(0.0)
+            self.level_bar.set_size_request(-1, 10)
+            wrap.pack_start(self.level_bar, False, False, 0)
+
+            self.hint = Gtk.Label(label="", xalign=0)
+            self.hint.get_style_context().add_class("subtitle")
+            self.hint.set_line_wrap(True)
+            self.hint.set_max_width_chars(48)
+            wrap.pack_start(self.hint, False, False, 0)
+
+            root.pack_start(wrap, True, True, 0)
+
+            foot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            foot.set_border_width(16)
+            note = Gtk.Label(label="Processa apenas o microfone. A saída do sistema não é alterada.", xalign=0)
+            note.get_style_context().add_class("subtitle")
+            note.set_line_wrap(True)
+            note.set_max_width_chars(42)
+            foot.pack_start(note, False, False, 0)
+
+            actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            actions.set_halign(Gtk.Align.END)
+            settings = Gtk.Button(label="Configurações")
+            settings.get_style_context().add_class("flat")
+            settings.connect("clicked", lambda *_: self.open_settings())
+            actions.pack_start(settings, False, False, 0)
+            close = Gtk.Button(label="Fechar")
+            close.get_style_context().add_class("flat")
+            close.connect("clicked", lambda *_: self._on_close())
+            actions.pack_start(close, False, False, 0)
+            foot.pack_start(actions, False, False, 0)
+            root.pack_end(foot, False, False, 0)
+
+        # ------------------------------------------------------------- bandeja
+        def _build_tray(self) -> None:
+            self.tray_controller = SystemTray(self, "audio-input-microphone")
+            self.tray = self.tray_controller if self.tray_controller.build() else None
+
+        def show_window(self) -> None:
+            self.window.show_all()
+            self.window.deiconify()
+            self.window.present()
+
+        def on_tray_unavailable(self) -> None:
+            """Chamado quando a bandeja não pôde ser registrada.
+
+            Iniciado com --hidden, o app ficaria sem janela e sem ícone; aqui
+            ele se torna visível e explica o motivo.
+            """
+            if not self.tray_controller or self.tray_controller.is_registered():
+                return
+            self.tray = None
+            self._no_tray_notice = (
+                "Sem bandeja neste ambiente"
+                + (f" ({self.tray_controller.error})" if self.tray_controller.error else "")
+                + ". A janela fica aberta; use Configurações para sair."
+            )
+            self.hint.set_text(self._no_tray_notice)
+            self.show_window()
+
+        def toggle_window(self) -> None:
+            if self.window.get_visible():
+                self.window.hide()
+            else:
+                self.show_window()
+
+        def toggle_from_tray(self, want: bool | None) -> None:
+            """Toggle vindo da bandeja.
+
+            `want=None` significa "alterna o estado real do servidor" e é o
+            que o menu usa: ligar/desligar por fora (CLI, atalho) não pode
+            deixar o clique da bandeja sem efeito.
+            """
+            if want is None:
+                self._toggle_seq += 1
+                seq = self._toggle_seq
+                self._toggle_inflight += 1
+
+                def work() -> None:
+                    code, out = control("toggle")
+                    GLib.idle_add(self._on_toggle_result, seq, code, out)
+
+                threading.Thread(target=work, daemon=True).start()
+                return
+            self._syncing = True
+            try:
+                self.switch.set_active(want)
+                self.switch.set_state(want)
+            finally:
+                self._syncing = False
+            self._apply_enabled(want)
+
+        def _on_toggle_result(self, seq: int, code: int, out: str) -> bool:
+            self._toggle_inflight = max(0, self._toggle_inflight - 1)
+            if seq != self._toggle_seq:
+                return False
+            if code != 0:
+                self._show_hint(f"Falha ao alternar: {out}")
+            # o status real (mix, enabled e intensidade) vem do servidor
+            self.refresh_async(force_mics=False)
+            return False
+
+        # ------------------------------------------------------- ações async
+        def _apply_enabled(self, want: bool) -> None:
+            """Aplica o toggle em segundo plano; a UI responde na hora.
+
+            Cada intenção recebe um número de sequência. Resultados de
+            requisições antigas são descartados: sem isso, dois cliques rápidos
+            podiam terminar na ordem inversa e deixar o servidor ligado com a
+            interface mostrando desligado.
+            """
+            self._toggle_seq += 1
+            seq = self._toggle_seq
+            self._toggle_inflight += 1
+            # feedback otimista: o widget já mudou, o servidor confirma depois
+            self.enabled = want
+            self._render_state()
+            if self.tray:
+                self.tray.update_state(want)
+
+            def work() -> None:
+                code, out = control("on" if want else "off")
+                GLib.idle_add(self._on_enabled_result, seq, want, code, out)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _on_enabled_result(self, seq: int, want: bool, code: int, out: str) -> bool:
+            self._toggle_inflight = max(0, self._toggle_inflight - 1)
+            # Uma intenção mais nova já foi enviada — este resultado é obsoleto.
+            if seq != self._toggle_seq:
+                return False
+            if code != 0:
+                self._show_hint(f"Falha: {out}")
+                # reverte o feedback otimista para o estado real
+                self.refresh_async(force_mics=False)
+            else:
+                # `on` aplica a intensidade salva, que pode diferir do slider
+                # (ex.: usuário mexeu em outro cliente). Re-sincroniza para a
+                # UI não mostrar 95% com o filtro rodando em outro valor.
+                self._clear_sticky_hint()
+                self.refresh_async(force_mics=False)
+            return False
+
+        def _on_toggle(self, switch, state: bool) -> bool:
+            if self._syncing:
+                return True
+            # O GtkSwitch guarda 'active' (intenção) e 'state' (desenho). O
+            # tema só pinta :checked quando state == active, e o GTK não faz
+            # essa sincronização sozinho quando o handler controla o fluxo.
+            # Sem o set_state abaixo o trilho fica cinza mesmo ligado.
+            switch.set_state(state)
+            self._apply_enabled(state)
+            return False
+
+        def _on_intensity(self, scale, value: float | None = None) -> None:
+            if self._syncing:
+                return
+            value = round(scale.get_value() if value is None else value, 2)
+            self.intensity_value.set_text(f"{int(value * 100)}%")
+            if abs(value - self.intensity) < 0.005:
+                return
+            self.intensity = value
+            self._queue_intensity(value)
+
+        def _queue_intensity(self, value: float) -> None:
+            """Coalesce mudanças do slider: grava no máximo a cada ~120 ms.
+
+            Sem isso, cada pixel arrastado disparava um processo (~75 ms) e a
+            interface engasgava.
+            """
+            self._pending_intensity = value
+            if self._intensity_timer is None:
+                self._intensity_timer = GLib.timeout_add(120, self._flush_intensity)
+
+        def _flush_intensity(self) -> bool:
+            self._intensity_timer = None
+            value = self._pending_intensity
+            self._pending_intensity = None
+            if value is None:
+                return False
+
+            def work() -> None:
+                code, out = control("intensity", str(value))
+                if code != 0:
+                    GLib.idle_add(self._show_hint, f"Falha na intensidade: {out}")
+
+            threading.Thread(target=work, daemon=True).start()
+            return False
+
+        def _clear_sticky_hint(self) -> None:
+            self._sticky_hint = ""
+
+        def _show_hint(self, text: str) -> bool:
+            # Erro/ação do usuário não pode ser apagado ~100 ms depois pelo
+            # refresh de status. Fica "preso" até a próxima ação bem-sucedida.
+            self._sticky_hint = text or ""
+            self.hint.set_text(text)
+            return False
+
+        def _on_mic_changed(self, combo) -> None:
+            # Ignora mudanças programáticas (popular lista / sincronizar).
+            if self._syncing:
+                return
+            idx = combo.get_active()
+            if idx < 0 or idx >= len(self.mics):
+                return
+            name, _desc = self.mics[idx]
+            if name == self.mic:
+                return
+            self.mic = name
+
+            def work() -> None:
+                code, out = control("mic", name)
+                GLib.idle_add(self._on_mic_result, name, code, out)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _on_mic_result(self, name: str, code: int, out: str) -> bool:
+            if code != 0:
+                self._show_hint(f"Falha ao trocar microfone: {out}")
+            else:
+                self._clear_sticky_hint()
+            self.refresh_async(force_mics=True)
+            return False
+
+        # --------------------------------------------------------- estado
+        def refresh_async(self, force_mics: bool = False) -> None:
+            """Atualiza o estado sem bloquear a thread do GTK."""
+            if self._refresh_inflight:
+                self._refresh_pending = True
+                return
+            self._refresh_inflight = True
+            want_mics = force_mics or not self.mics
+            # Um status pedido ANTES de um toggle descreve o estado anterior.
+            # A geração viaja com o resultado para que ele não desfaça a
+            # intenção do usuário quando chega depois da resposta do toggle.
+            generation = self._toggle_seq
+
+            def work() -> None:
+                state = control_json("status")
+                mics_raw = control("mics")[1] if want_mics else None
+                GLib.idle_add(self._on_state, state, mics_raw, want_mics, generation)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _on_state(self, state: dict, mics_raw: str | None, want_mics: bool,
+                      generation: int | None = None) -> bool:
+            self._refresh_inflight = False
+
+            if state:
+                self.available = bool(state.get("available"))
+                # Enquanto um toggle está em voo, o status pode refletir o
+                # valor ANTERIOR à intenção do usuário. Aplicar esse valor
+                # aqui fazia a UI voltar atrás no meio do clique duplo (e era
+                # a outra metade do bug de "UI diz OFF, servidor ligado").
+                # O mesmo vale para um status pedido antes do toggle que
+                # chega depois: a geração denuncia que ele é antigo.
+                stale = (
+                    self._toggle_inflight > 0
+                    or (generation is not None and generation != self._toggle_seq)
+                )
+                if not stale:
+                    self.enabled = bool(state.get("enabled"))
+                self.mic = state.get("mic") or ""
+                if state.get("intensity") is not None:
+                    self.intensity = float(state["intensity"])
+                    self._syncing = True
+                    try:
+                        self.intensity_scale.set_value(self.intensity)
+                    finally:
+                        self._syncing = False
+                    self.intensity_value.set_text(f"{int(self.intensity * 100)}%")
+                self.switch.set_sensitive(self.available)
+                # set_active() dispara 'state-set'; sem a guarda isso reenvia
+                # o toggle ao servidor a cada refresh.
+                self._syncing = True
+                try:
+                    self.switch.set_active(self.enabled)
+                    # mantém o desenho (:checked) alinhado ao estado real
+                    self.switch.set_state(self.enabled)
+                finally:
+                    self._syncing = False
+                self._render_state()
+
+                sticky = getattr(self, "_sticky_hint", "")
+                if self.available and not state.get("source_connected", True):
+                    self.hint.set_text("Reconectando o microfone…")
+                    threading.Thread(target=self._reconnect_worker, daemon=True).start()
+                elif sticky:
+                    self.hint.set_text(sticky)
+                elif self.available:
+                    # Não apagar o aviso de "sem bandeja": ele é a única
+                    # explicação de por que a janela abriu sozinha.
+                    self.hint.set_text(getattr(self, "_no_tray_notice", ""))
+                else:
+                    self.hint.set_text(
+                        "Filtro indisponível. Rode scripts/linux/setup-denoiser.sh."
+                    )
+
+            if mics_raw is not None and want_mics:
+                self._apply_mics(mics_raw)
+
+            if self.tray:
+                self.tray.update_state(self.enabled)
+
+            if self._refresh_pending:
+                self._refresh_pending = False
+                self.refresh_async()
+            return False
+
+        def _reconnect_worker(self) -> None:
+            code, _out = control("reconnect")
+            if code == 0:
+                self.refresh_async()
+
+        def _render_state(self) -> None:
+            if self.enabled:
+                self.state_label.set_text("ligado — voz limpa")
+                self.state_label.get_style_context().remove_class("state-off")
+                self.state_label.get_style_context().add_class("state-on")
+            else:
+                self.state_label.set_text("desligado — áudio original")
+                self.state_label.get_style_context().remove_class("state-on")
+                self.state_label.get_style_context().add_class("state-off")
+
+        def _apply_mics(self, out: str) -> None:
+            entries: list[tuple[str, str]] = []
+            for line in out.splitlines():
+                line = line.rstrip("\n")
+                if not line.strip() or "\t" not in line:
+                    continue
+                line = line.strip()
+                line = line[2:] if line.startswith("* ") else line
+                line = line.strip()
+                name, desc = line.split("\t", 1)
+                entries.append((name.strip(), desc.strip()))
+            if not entries:
+                return
+            self.mics = entries
+            self._syncing = True
+            try:
+                self.mic_combo.remove_all()
+                for _name, desc in entries:
+                    self.mic_combo.append_text(desc)
+                for i, (name, _desc) in enumerate(entries):
+                    if name == self.mic:
+                        self.mic_combo.set_active(i)
+                        break
+                else:
+                    self.mic_combo.set_active(0)
+            finally:
+                self._syncing = False
+
+        # -------------------------------------------------------- medidor
+        def _start_level_stream(self) -> None:
+            """Lê o nível de um único pw-cat contínuo (não um processo por amostra)."""
+            self._level_thread = threading.Thread(
+                target=self._level_worker, daemon=True
+            )
+            self._level_thread.start()
+
+        def _level_worker(self) -> None:
+            failures = 0
+            while not self._closing:
+                try:
+                    # start_new_session=True: o controlador e o pw-cat que ele
+                    # cria ficam num grupo próprio. Fechar o app pode então
+                    # sinalizar o grupo inteiro e não deixar pw-cat órfão
+                    # (encerrar só o controlador depende de SIGPIPE para o
+                    # neto morrer, o que não é determinístico).
+                    proc = subprocess.Popen(
+                        [CONTROL, "level-stream"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        bufsize=1,
+                        start_new_session=True,
+                    )
+                except OSError:
+                    # Nada de desistir para sempre: backoff e nova tentativa.
+                    failures += 1
+                    GLib.idle_add(
+                        self._show_hint,
+                        "Medidor indisponível; tentando novamente…",
+                    )
+                    self._sleep_backoff(failures)
+                    continue
+
+                self._level_stream = proc
+                assert proc.stdout is not None
+                produced = False
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # O controlador imprime "ready" quando o stream abre.
+                    # Antes ele imprimia 0, que era lido como 0 dBFS (barra no
+                    # máximo) a cada (re)início do stream.
+                    if line == "ready":
+                        continue
+                    try:
+                        db = float(line)
+                    except ValueError:
+                        continue
+                    produced = True
+                    self._last_level = db
+                    GLib.idle_add(self._on_level, db)
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+                if self._closing:
+                    break
+                if produced:
+                    failures = 0
+                else:
+                    # pw-cat saiu sem produzir nada (nó ausente?). Sem backoff
+                    # isso virava um par control+pw-cat por segundo, para
+                    # sempre.
+                    failures += 1
+                self._sleep_backoff(failures)
+
+        @staticmethod
+        def _sleep_backoff(failures: int) -> None:
+            import time
+
+            # 1s, 2s, 4s… até 15s — rápido para recuperar de um restart do
+            # PipeWire, lento para não consumir CPU num ambiente quebrado.
+            # `2 ** n` estoura para n grande (OverflowError mata a thread do
+            # medidor para sempre); o teto vem antes da exponenciação.
+            exponent = min(max(0, failures - 1), 4)
+            time.sleep(min(15.0, float(2 ** exponent)))
+
+        def _stop_level_stream(self) -> None:
+            proc = self._level_stream
+            if proc is None:
+                return
+            self._level_stream = None
+            try:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+
+        def _on_level(self, db: float) -> bool:
+            # -60..0 dBFS -> 0..1
+            frac = (max(-60.0, min(0.0, db)) + 60.0) / 60.0
+            self.level_bar.set_value(frac)
+            if db <= -59.0:
+                self.level_value.set_text("—")
+            else:
+                self.level_value.set_text(f"{db:.0f} dB")
+            return False
+
+        # --------------------------------------------------- configurações
+        def open_settings(self) -> None:
+            if self._settings_win is not None:
+                self._settings_win.present()
+                return
+
+            win = Gtk.Window(title="nvclean — configurações")
+            win.set_transient_for(self.window)
+            win.set_default_size(400, -1)
+            win.set_resizable(False)
+            win.get_style_context().add_class("settings")
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+            outer.set_border_width(20)
+            win.add(outer)
+
+            title = Gtk.Label(label="Configurações", xalign=0)
+            title.get_style_context().add_class("title")
+            outer.pack_start(title, False, False, 0)
+
+            start_check = Gtk.CheckButton(
+                label="Iniciar junto com o sistema (só na bandeja)"
+            )
+            start_check.set_active(autostart_installed())
+            outer.pack_start(start_check, False, False, 0)
+
+            bg_check = Gtk.CheckButton(
+                label="Continuar em segundo plano ao fechar a janela"
+            )
+            bg_check.set_active(bool(self.settings.get("stay_in_background", True)))
+            outer.pack_start(bg_check, False, False, 0)
+
+            hint = Gtk.Label(label="", xalign=0)
+            hint.get_style_context().add_class("subtitle")
+            hint.set_line_wrap(True)
+            hint.set_max_width_chars(44)
+            outer.pack_start(hint, False, False, 0)
+
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.set_halign(Gtk.Align.END)
+            quit_btn = Gtk.Button(label="Sair agora")
+            quit_btn.connect("clicked", lambda *_: self.quit())
+            close_btn = Gtk.Button(label="Fechar")
+            close_btn.connect("clicked", lambda *_: win.close())
+            row.pack_start(quit_btn, False, False, 0)
+            row.pack_start(close_btn, False, False, 0)
+            outer.pack_start(row, False, False, 0)
+
+            def on_start(toggle) -> None:
+                # Guarda: reverter o CheckButton emite 'toggled' de novo. Sem
+                # isso, uma falha de escrita (disco cheio / ~/.config somente
+                # leitura) reentrava em on_start indefinidamente.
+                if getattr(on_start, "busy", False):
+                    return
+                enabled = toggle.get_active()
+                on_start.busy = True
+                try:
+                    if apply_autostart(enabled):
+                        self.settings["start_with_system"] = enabled
+                        save_settings(self.settings)
+                        hint.set_text(
+                            "Autostart ativado." if enabled else "Autostart desativado."
+                        )
+                    else:
+                        toggle.set_active(not enabled)
+                        hint.set_text(
+                            "Não foi possível alterar o autostart "
+                            "(verifique ~/.config/autostart)."
+                        )
+                finally:
+                    on_start.busy = False
+
+            def on_background(toggle) -> None:
+                self.settings["stay_in_background"] = toggle.get_active()
+                save_settings(self.settings)
+                hint.set_text(
+                    "A janela continuará na bandeja ao fechar."
+                    if toggle.get_active()
+                    else "Fechar a janela encerrará o app."
+                )
+
+            start_check.connect("toggled", on_start)
+            bg_check.connect("toggled", on_background)
+            win.connect("destroy", lambda *_: setattr(self, "_settings_win", None))
+            self._settings_win = win
+            win.show_all()
+
+        # --------------------------------------------------- ciclo de vida
+        def _on_close(self, *_args) -> bool:
+            if self.settings.get("stay_in_background", True):
+                self.window.hide()
+                return True
+            # preferência: fechar de vez
+            self.quit()
+            return True
+
+        def quit(self) -> None:
+            if self._closing:
+                return
+            self._closing = True
+            self._stop_level_stream()
+            Gtk.main_quit()
+
+    # Instância única: com a bandeja, abrir o .desktop de novo com o app
+    # escondido criaria um segundo ícone (e um segundo medidor). O lock impede
+    # isso e, se já houver instância, apenas reabre a janela dela.
+    #
+    # Nada de /tmp (world-writable, e `open("w")` segue symlink podendo truncar
+    # um arquivo do usuário). Preferência: XDG_RUNTIME_DIR, senão o estado do
+    # próprio usuário.
+    _lock_dir = os.environ.get("NVCLEAN_LOCK_DIR") or (
+        os.environ.get("XDG_RUNTIME_DIR")
+        or os.path.join(
+            os.environ.get("XDG_STATE_HOME")
+            or os.path.expanduser("~/.local/state"),
+        )
+    )
+    # Subpasta propria: $XDG_RUNTIME_DIR/app.lock e generico demais e pode
+    # colidir com outro app.
+    _lock_dir = os.path.join(_lock_dir, "nvclean")
+    _lock_path = os.path.join(_lock_dir, "app.lock")
+    _lock_fh = None
+    _already_running = False
+    try:
+        import errno
+        import fcntl
+
+        os.makedirs(_lock_dir, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        _fd = os.open(_lock_path, flags, 0o600)
+        _lock_fh = os.fdopen(_fd, "r+", encoding="utf-8")
+        try:
+            fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            # Só EWOULDBLOCK/EAGAIN significam "outra instância". Qualquer
+            # outro errno (ENOLCK em NFS/FUSE, EACCES...) quer dizer que o
+            # lock NÃO funciona aqui — e aí o app deve abrir normalmente, em
+            # vez de sair achando que já existe uma instância.
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                _already_running = True
+            else:
+                _lock_fh = None
+    except (OSError, ImportError):
+        # Sem lock disponível (filesystem estranho): não bloqueia o app.
+        _lock_fh = None
+
+    if _already_running:
+        # já existe: pede para a instância viva abrir a janela e sai.
+        try:
+            subprocess.run(
+                ["gdbus", "call", "--session", "--dest", "org.nvclean.App",
+                 "--object-path", "/StatusNotifierItem",
+                 "--method", "org.kde.StatusNotifierItem.Activate", "0", "0"],
+                capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return 0
+
+    app = App()
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    signal.signal(signal.SIGTERM, lambda *_: app.quit())
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
