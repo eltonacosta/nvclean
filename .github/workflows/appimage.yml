@@ -120,9 +120,13 @@ jobs:
       - name: Guardar o AppImage como artefato
         uses: actions/upload-artifact@v4
         with:
+          # Nome fixo + overwrite: cada run SUBSTITUI o artefato anterior em
+          # vez de acumular um por run. O artefato antigo (e seu ID) deixa de
+          # existir; a lista passa a ter sempre o mais novo no topo.
           name: nvclean-appimage
           path: dist/nvclean-*-x86_64.AppImage
           if-no-files-found: error
+          overwrite: true
           retention-days: 30
 
       - name: Publicar na Release (tags)

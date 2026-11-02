@@ -4,6 +4,41 @@ Todas as mudanças relevantes do nvclean. O formato segue
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 usa [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.3.0] — 2026-11-02
+
+### Adicionado
+
+- **Licença GPL-3.0-or-later** (`LICENSE`), com o texto integral da GPL-3.0 e
+  o nome por extenso **Noise Vocal Clean** documentado no README. O projeto era
+  publicado sem licença até aqui.
+- `THIRD-PARTY.md` com o copyright BSD-3-Clause do **RNNoise** (a
+  `librnnoise.so.0` é empacotada no AppImage) e a lista de dependências do
+  sistema.
+- Cabeçalho `SPDX-License-Identifier: GPL-3.0-or-later` e copyright em todos
+  os fontes (app, controlador, serviço, plugins C, ferramentas e packaging).
+- **Aviso legal na janela de Configurações**: copyright, ausência de garantia e
+  link da licença (GPL §5d, exigido para interface interativa).
+- `LICENSE`, `THIRD-PARTY.md` e `CHANGELOG.md` passam a acompanhar o AppImage
+  (GPL §6: a licença precisa ir junto do binário distribuído).
+- Seção **Requisitos e plataformas** no README: o projeto é Linux-only, exige
+  PipeWire e `systemd --user`, e o AppImage publicado é x86_64.
+
+### Alterado
+
+- README enxugado de 366 para 260 linhas: a abertura explica que o **NVIDIA
+  Broadcast nunca foi lançado para Linux** — motivo da engenharia reversa — e
+  destaca que o nvclean roda em **qualquer CPU, sem GPU NVIDIA nem RTX**.
+- Tabela comparativa com o Broadcast sobe para o topo e ganha as linhas *Onde
+  roda* e *Hardware*.
+- Build, CI e publicação fundidos em uma única seção **Desenvolvimento**.
+
+### Corrigido
+
+- **CI acumulava um artefato por push**: `upload-artifact` agora usa
+  `overwrite: true`, então cada run **substitui** o `nvclean-appimage`
+  anterior em vez de deixar um artefato novo a cada atualização. A lista fica
+  sempre com o mais recente no topo.
+
 ## [1.2.0] — 2026-10-30
 
 ### Adicionado
