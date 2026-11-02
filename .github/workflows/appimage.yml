@@ -1,0 +1,142 @@
+name: AppImage
+
+# Gera o AppImage do nvclean a cada push e guarda como artefato do run.
+# Em tags v* também publica o AppImage como anexo de uma Release.
+#
+# Por que compilar o RNNoise do fonte: o Ubuntu LTS usado nos runners
+# (22.04/jammy e 24.04/noble) NÃO empacota librnnoise-dev. Só as versões
+# futuras do Ubuntu têm o pacote. Compilar é determinístico e não depende
+# de PPA.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appimage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Tag fixa: o master do RNNoise carrega um modelo maior (~3,5 MB em
+  # .rodata), o que dobraria o AppImage. A v0.2 é estável e mantém o
+  # pacote em ~2 MB. Para atualizar, troque a tag conscientemente.
+  RNNOISE_REPO: https://github.com/xiph/rnnoise.git
+  RNNOISE_REF: v0.2
+  APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+
+jobs:
+  build:
+    name: Build AppImage
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependências do sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            autoconf automake libtool pkg-config \
+            curl ca-certificates file zsync \
+            libsndfile1-dev
+
+      - name: Cache do appimagetool
+        id: cache-appimagetool
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/opt/nvclean-build/appimagetool
+          key: appimagetool-continuous-x86_64-v1
+
+      - name: Baixar o appimagetool
+        if: steps.cache-appimagetool.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/.local/opt/nvclean-build"
+          curl -fsSL -o "$HOME/.local/opt/nvclean-build/appimagetool" "$APPIMAGETOOL_URL"
+          chmod +x "$HOME/.local/opt/nvclean-build/appimagetool"
+
+      - name: Compilar o RNNoise
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$RNNOISE_REF" "$RNNOISE_REPO" "$RUNNER_TEMP/rnnoise"
+          cd "$RUNNER_TEMP/rnnoise"
+          # autogen.sh roda autoreconf -isf; configure gera a .so
+          ./autogen.sh
+          ./configure --prefix="$RUNNER_TEMP/rnnoise-install" --disable-examples --disable-doc
+          make -j"$(nproc)"
+          make install
+
+          # O build-appimage.sh copia o arquivo e cria o symlink. Pega o
+          # arquivo real (librnnoise.so.0.x.y), não o symlink.
+          lib="$(find "$RUNNER_TEMP/rnnoise-install" -name 'librnnoise.so.0.*' -type f | head -1)"
+          [ -n "$lib" ] || { echo "librnnoise.so não foi gerada" >&2; exit 1; }
+          echo "librnnoise: $lib ($(stat -c%s "$lib") bytes)"
+          objdump -p "$lib" | grep -q 'SONAME.*librnnoise.so.0' \
+            || { echo "SONAME inesperado em $lib" >&2; exit 1; }
+          # um modelo absurdo indica que a tag mudou; avisa sem falhar
+          size="$(stat -c%s "$lib")"
+          if [ "$size" -gt 3000000 ]; then
+            echo "aviso: librnnoise com $size bytes (modelo grande?)" >&2
+          fi
+          echo "RNNOISE_SO=$lib" >> "$GITHUB_ENV"
+          # o plugin inclui <rnnoise.h>, que vem do prefixo do build
+          echo "RNNOISE_INCLUDE=$RUNNER_TEMP/rnnoise-install/include" >> "$GITHUB_ENV"
+
+      - name: Gerar o AppImage
+        run: |
+          set -euo pipefail
+          chmod +x ./packaging/build-appimage.sh
+          ./packaging/build-appimage.sh --clean
+
+      - name: Verificar o AppImage
+        run: |
+          set -euo pipefail
+          appimage="$(ls dist/nvclean-*-x86_64.AppImage | head -1)"
+          [ -n "$appimage" ] || { echo "AppImage não foi gerado" >&2; exit 1; }
+          file "$appimage"
+          # --check exercita a instalação de forma não destrutiva; o ambiente
+          # do runner não tem PipeWire, então a checagem pode reclamar de
+          # dependência de runtime. O que importa aqui é o pacote abrir.
+          ./"$appimage" --appimage-extract-and-run --check || true
+          # confere que o AppDir contém o essencial
+          ./"$appimage" --appimage-extract >/dev/null
+          for f in AppRun nvclean.desktop usr/share/nvclean/nvclean-app \
+                   usr/share/nvclean/nvclean-control \
+                   usr/lib/nvclean/nvclean_rnnoise_stereo.so; do
+            [ -e "squashfs-root/$f" ] || { echo "faltando no AppImage: $f" >&2; exit 1; }
+          done
+          echo "conteúdo do AppImage OK"
+
+      - name: Guardar o AppImage como artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvclean-appimage
+          path: dist/nvclean-*-x86_64.AppImage
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publicar na Release (tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          appimage="$(ls dist/nvclean-*-x86_64.AppImage | head -1)"
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$appimage" --clobber
+          else
+            gh release create "$tag" "$appimage" \
+              --title "nvclean ${tag}" \
+              --generate-notes
+          fi

@@ -2,9 +2,9 @@
 """Verifica que a SAÍDA de áudio do sistema não foi alterada pelo nvclean.
 
 Compara o estado atual com um baseline salvo antes de instalar/executar:
-  • presença dos nós effect_input.boost3x / effect_output.boost3x
-  • valor do parâmetro boost:Mult (esperado 3.0)
-  • hash do arquivo 51-boost3x.conf do usuário
+  • nome do sink padrão (metadata do WirePlumber)
+  • conjunto de sinks de saída expostos pelo PipeWire
+  • presença de filtros virtuais de saída (nós "effect_*", sinks de filtro)
 
 Uso:
   ./tools/check-output-untouched.py --save     # grava o baseline
@@ -15,51 +15,74 @@ Sai com código 1 quando algo mudou, para poder rodar em CI/teste.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import subprocess
 import sys
 
-BOOST_CONF = os.path.expanduser(
-    "~/.config/pipewire/pipewire.conf.d/51-boost3x.conf"
-)
 BASELINE = os.path.expanduser("~/.local/state/nvclean/output-baseline.json")
-NODES = ("effect_input.boost3x", "effect_output.boost3x")
+DEFAULT_SINK_KEY = "default.configured.audio.sink"
+NVCLEAN_SINK = "nvclean.input"
+
+
+def run(cmd: list[str], timeout: int = 15) -> str:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit(f"não foi possível executar {cmd[0]}: {exc}")
+    if proc.returncode != 0:
+        raise SystemExit(f"{cmd[0]} falhou: {proc.stderr.strip()}")
+    return proc.stdout
 
 
 def dump() -> list[dict]:
-    try:
-        proc = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SystemExit(f"não foi possível ler o PipeWire: {exc}")
-    if proc.returncode != 0:
-        raise SystemExit(f"pw-dump falhou: {proc.stderr.strip()}")
-    return json.loads(proc.stdout)
+    return json.loads(run(["pw-dump"]))
+
+
+def default_sink() -> str | None:
+    """Lê o sink padrão configurado na metadata 'default' do WirePlumber."""
+    out = run(["pw-metadata", "-n", "default"])
+    prefix = f"key:'{DEFAULT_SINK_KEY}' value:'"
+    for line in out.splitlines():
+        if prefix not in line:
+            continue
+        rest = line.split(prefix, 1)[1]
+        # O valor termina no `'` antes de " type:"
+        value = rest.split("' type:", 1)[0]
+        try:
+            return json.loads(value).get("name")
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
 def snapshot() -> dict:
-    objects = dump()
-    found: dict[str, dict] = {}
-    for obj in objects:
-        props = (obj.get("info") or {}).get("props") or {}
+    sinks: list[str] = []
+    virtual_filters: list[str] = []
+    for obj in dump():
+        info = obj.get("info") or {}
+        props = info.get("props") or {}
         name = props.get("node.name")
-        if name not in NODES:
+        if not name:
             continue
-        mult = None
-        for item in ((obj.get("info") or {}).get("params") or {}).get("Props") or []:
-            params = item.get("params") or []
-            for i in range(0, len(params) - 1, 2):
-                if str(params[i]).endswith("Mult"):
-                    mult = params[i + 1]
-        found[name] = {"media_class": props.get("media.class"), "mult": mult}
+        # Sinks de reprodução: Audio/Sink e Audio/Duplex. Os nós do próprio
+        # nvclean (entrada do microfone) não fazem parte da saída.
+        if props.get("media.class") not in ("Audio/Sink", "Audio/Duplex"):
+            continue
+        if name == NVCLEAN_SINK or name.startswith("nvclean."):
+            continue
+        sinks.append(name)
+        # Filtros do PipeWire expõem-se com prefixo effect_ e costumam ser
+        # marcados como filter.smart; qualquer um deles no caminho de
+        # reprodução significa que a saída passou a ser processada.
+        if name.startswith("effect_") or props.get("filter.smart") in (True, "true"):
+            virtual_filters.append(name)
 
-    conf_hash = None
-    if os.path.isfile(BOOST_CONF):
-        with open(BOOST_CONF, "rb") as fh:
-            conf_hash = hashlib.sha256(fh.read()).hexdigest()
-
-    return {"nodes": found, "conf_sha256": conf_hash, "conf_path": BOOST_CONF}
+    return {
+        "default_sink": default_sink(),
+        "sinks": sorted(sinks),
+        "virtual_filters": sorted(virtual_filters),
+    }
 
 
 def main() -> int:
@@ -75,10 +98,11 @@ def main() -> int:
         with open(BASELINE, "w", encoding="utf-8") as fh:
             json.dump(current, fh, indent=1, ensure_ascii=False)
         print(f"baseline salvo em {BASELINE}")
-        for name, info in current["nodes"].items():
-            print(f"  {name}: mult={info['mult']} class={info['media_class']}")
-        if not current["nodes"]:
-            print("  (nenhum nó de boost encontrado — nada a proteger aqui)")
+        print(f"  sink padrão: {current['default_sink']}")
+        for name in current["sinks"]:
+            print(f"  sink: {name}")
+        if current["virtual_filters"]:
+            print(f"  ! filtros virtuais presentes: {', '.join(current['virtual_filters'])}")
         return 0
 
     if not os.path.isfile(BASELINE):
@@ -90,25 +114,23 @@ def main() -> int:
 
     problems: list[str] = []
 
-    for name in NODES:
-        before = base["nodes"].get(name)
-        after = current["nodes"].get(name)
-        if before and not after:
-            problems.append(f"nó {name} DESAPARECEU")
-        elif before and after:
-            if before.get("mult") != after.get("mult"):
-                problems.append(
-                    f"{name}: Mult mudou de {before.get('mult')} para {after.get('mult')}"
-                )
-            if before.get("media_class") != after.get("media_class"):
-                problems.append(f"{name}: media.class mudou")
-
-    if base.get("conf_sha256") and current.get("conf_sha256") != base["conf_sha256"]:
+    if base.get("default_sink") != current["default_sink"]:
         problems.append(
-            f"{current['conf_path']} foi modificado (hash diferente)"
+            f"sink padrão mudou de {base.get('default_sink')} para {current['default_sink']}"
         )
-    if base.get("conf_sha256") and current.get("conf_sha256") is None:
-        problems.append(f"{current['conf_path']} foi REMOVIDO")
+
+    base_sinks = set(base.get("sinks") or [])
+    cur_sinks = set(current["sinks"])
+    # Dispositivos plugados depois do baseline (fones, HDMI, USB) não são
+    # alteração do nvclean; o que importa é que nenhum sink existente tenha
+    # sumido e que nenhum filtro virtual tenha aparecido.
+    removed = base_sinks - cur_sinks
+    if removed:
+        problems.append(f"sinks removidos: {', '.join(sorted(removed))}")
+    if current["virtual_filters"]:
+        problems.append(
+            f"filtros virtuais no caminho de reprodução: {', '.join(current['virtual_filters'])}"
+        )
 
     if problems:
         print("FALHA — a saída de áudio do sistema foi alterada:", file=sys.stderr)
@@ -117,10 +139,9 @@ def main() -> int:
         return 1
 
     print("OK — saída do sistema intacta")
-    for name, info in current["nodes"].items():
-        print(f"  {name}: mult={info['mult']} class={info['media_class']}")
-    if current.get("conf_sha256"):
-        print(f"  {current['conf_path']}: hash preservado")
+    print(f"  sink padrão: {current['default_sink']}")
+    for name in current["sinks"]:
+        print(f"  sink: {name}")
     return 0
 
 

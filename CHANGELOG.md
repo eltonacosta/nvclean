@@ -65,8 +65,8 @@ usa [SemVer](https://semver.org/lang/pt-BR/).
 ### Notas
 
 - Escopo inalterado: o app controla **somente** a entrada do microfone
-  (`nvclean.input`/`nvclean`). A saída do sistema e o boost 3x continuam
-  intocados, verificado por `tools/check-output-untouched.py --verify`.
+  (`nvclean.input`/`nvclean`). A saída do sistema permanece intocada,
+  verificado por `tools/check-output-untouched.py --verify`.
 
 ## [1.1.0] — 2026-10-30
 

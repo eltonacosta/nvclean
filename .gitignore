@@ -1,6 +1,11 @@
 # Artefatos de build — recriados por packaging/build-appimage.sh
 build/
 dist/
+# AppImage copiado para fora de dist/ (README manda executar daqui) e
+# bibliotecas compiladas soltas (plugin LADSPA, librnnoise de builds locais)
+*.AppImage
+*.so
+*.so.*
 
 # Python
 __pycache__/

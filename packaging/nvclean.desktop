@@ -7,5 +7,6 @@ Exec=nvclean-app
 Icon=nvclean
 Terminal=false
 Categories=AudioVideo;Audio;
+StartupWMClass=nvclean
 Keywords=microphone;noise;ruido;denoise;nvclean;
 StartupNotify=true

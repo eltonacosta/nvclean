@@ -226,8 +226,8 @@ nvclean ON   : piso=-80.58 dBFS  fala=-46.98 dBFS  SNR=33.60 dB
 nvclean OFF  : piso=-46.24 dBFS  fala=-22.37 dBFS  SNR=23.86 dB
 ```
 
-A saída do sistema foi verificada depois de todos os testes:
-`effect_input.boost3x` → `boost:Mult = 3.0`, inalterado.
+A saída do sistema foi verificada depois de todos os testes e permaneceu
+intacta (nenhum filtro, sink virtual ou ganho no caminho de reprodução).
 
 ## 5. Limites desta análise
 

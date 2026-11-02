@@ -2,8 +2,7 @@
 """nvclean-control — controlador do filtro de ruído de ENTRADA (microfone).
 
 Escopo: manipula SOMENTE o filtro do microfone (nós "nvclean.input" /
-"nvclean"). A saída de áudio do sistema — inclusive o boost 3x em
-51-boost3x.conf — não é lida, alterada nem reconectada.
+"nvclean"). A saída de áudio do sistema não é lida, alterada nem reconectada.
 
 O nó virtual "nvclean" existe sempre (criado pelo filter-chain do PipeWire),
 então ligar/desligar é imediato e não reinicia o PipeWire: alterna o parâmetro

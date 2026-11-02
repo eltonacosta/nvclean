@@ -36,6 +36,11 @@ die()  { printf '\033[1;31mx\033[0m %s\n' "$*" >&2; exit 1; }
 
 command -v gcc >/dev/null || die "gcc não encontrado"
 
+# RNNOISE_SO permite ao CI apontar para uma lib compilada do fonte (o Ubuntu
+# LTS dos runners não empacota librnnoise-dev). Sem a variável, o
+# comportamento local continua igual: procura nos caminhos do sistema.
+RNNOISE_SO="${RNNOISE_SO:-}"
+
 # header LADSPA (mesma lógica do setup-denoiser.sh)
 LADSPA_HDR=""
 for p in /usr/include /usr/local/include /usr/include/ladspa "$HOME/.cache/nvclean"; do
@@ -51,14 +56,34 @@ if [ -z "$LADSPA_HDR" ]; then
   cp "$found" "$CACHE/ladspa.h"; LADSPA_HDR="$CACHE"
 fi
 
-# librnnoise: usa a do sistema e copia para dentro do AppImage
-RNNOISE_SO=""
-for p in /usr/lib /usr/lib64 /usr/local/lib "$HOME/.local/lib"; do
-  for f in "$p"/librnnoise.so.0 "$p"/librnnoise.so; do
-    [ -e "$f" ] && RNNOISE_SO="$(readlink -f "$f")" && break 2
+# header do RNNoise. O plugin inclui <rnnoise.h>; quando a lib vem de um build
+# do fonte (RNNOISE_SO=...), o header está no prefixo do build, mas não no
+# caminho padrão do compilador. RNNOISE_INCLUDE aponta para ele.
+RNNOISE_HDR="${RNNOISE_INCLUDE:-}"
+if [ -z "$RNNOISE_HDR" ] && [ -n "$RNNOISE_SO" ]; then
+  for candidate in "$(dirname "$RNNOISE_SO")/../include" "$(dirname "$RNNOISE_SO")"; do
+    [ -f "$candidate/rnnoise.h" ] && RNNOISE_HDR="$candidate" && break
   done
-done
-[ -n "$RNNOISE_SO" ] || die "librnnoise não encontrada (Arch: pacman -S rnnoise | Debian: apt install librnnoise0)"
+fi
+if [ -z "$RNNOISE_HDR" ]; then
+  for p in /usr/include /usr/local/include "$HOME/.local/include"; do
+    [ -f "$p/rnnoise.h" ] && RNNOISE_HDR="$p" && break
+  done
+fi
+[ -n "$RNNOISE_HDR" ] || die "rnnoise.h não encontrado (Arch: pacman -S rnnoise | Debian: compile o RNNoise do fonte e defina RNNOISE_INCLUDE=/caminho/include)"
+
+# librnnoise: usa a do sistema e copia para dentro do AppImage.
+if [ -n "$RNNOISE_SO" ]; then
+  [ -r "$RNNOISE_SO" ] || die "RNNOISE_SO aponta para arquivo ilegível: $RNNOISE_SO"
+  RNNOISE_SO="$(readlink -f "$RNNOISE_SO")"
+else
+  for p in /usr/lib /usr/lib64 /usr/local/lib "$HOME/.local/lib"; do
+    for f in "$p"/librnnoise.so.0 "$p"/librnnoise.so; do
+      [ -e "$f" ] && RNNOISE_SO="$(readlink -f "$f")" && break 2
+    done
+  done
+fi
+[ -n "$RNNOISE_SO" ] || die "librnnoise não encontrada (Arch: pacman -S rnnoise | Debian: apt install librnnoise0). Para compilar do fonte, defina RNNOISE_SO=/caminho/librnnoise.so.0"
 
 say "nvclean $VERSION — montando AppDir"
 rm -rf "$APPDIR"
@@ -71,7 +96,7 @@ cp "$RNNOISE_SO" "$APPDIR/usr/lib/librnnoise.so.0"
 ln -sf librnnoise.so.0 "$APPDIR/usr/lib/librnnoise.so"
 
 gcc -O2 -fPIC -shared -Wall -Wextra \
-  -I"$LADSPA_HDR" -I/usr/include \
+  -I"$LADSPA_HDR" -I"$RNNOISE_HDR" -I/usr/include \
   -o "$APPDIR/usr/lib/nvclean/nvclean_rnnoise_stereo.so" \
   "$HERE/src/ladspa/rnnoise_stereo.c" \
   -L"$APPDIR/usr/lib" -l:librnnoise.so.0 \

@@ -6,8 +6,7 @@ limpador de voz do microfone, seleção do microfone de origem, intensidade do
 efeito e um medidor de nível.
 
 ESCOPO — só ENTRADA. O app controla exclusivamente os nós "nvclean.input" /
-"nvclean". A saída de áudio do sistema (alto-falantes/fones) e o boost 3x do
-usuário não são tocados.
+"nvclean". A saída de áudio do sistema (alto-falantes/fones) não é tocada.
 
 DESEMPENHO — nada de subprocesso na thread do GTK. Leitura de estado, troca de
 microfone, toggle e intensidade rodam em threads de trabalho; o medidor lê um
@@ -365,6 +364,18 @@ def main(argv: list[str]) -> int:
         return code
 
     hidden = "--hidden" in argv
+
+    # Identidade do aplicativo para o ambiente gráfico.
+    #
+    # O app_id no Wayland e o WM_CLASS no X11 vêm de g_get_prgname() /
+    # gdk_get_program_class() (GDK e GTK3). Sem isso, o valor é o basename do
+    # executável ("nvclean-app"), que não casa com o id do arquivo
+    # "nvclean.desktop" — e o GNOME mostra o ícone genérico na barra de apps.
+    # Definindo os três antes de qualquer janela, app_id == WM_CLASS == id do
+    # .desktop == nome do ícone.
+    GLib.set_prgname(APP_ID)
+    GLib.set_application_name("nvclean")
+    Gdk.set_program_class(APP_ID)
 
     # -----------------------------------------------------------------
     # Bandeja: StatusNotifierItem + DBusMenu (o que GNOME/KDE usam hoje).
@@ -740,6 +751,9 @@ def main(argv: list[str]) -> int:
             self.window.set_default_size(420, 620)
             self.window.set_resizable(False)
             self.window.set_border_width(0)
+            # Ícone da janela: usado pelo X11 e por painéis legados. No
+            # Wayland o ícone vem do app_id + .desktop (ver main()).
+            self.window.set_icon_name(APP_ID)
             self.window.connect("delete-event", self._on_close)
             self.window.connect("destroy", lambda *_: self.quit())
 

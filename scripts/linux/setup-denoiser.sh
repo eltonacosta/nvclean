@@ -9,8 +9,9 @@
 #   4. reinicia o pipewire só para carregar o filtro
 #   5. conecta o microfone atual e mostra o diagnóstico
 #
-# O que NÃO faz: não toca na saída de áudio do sistema, não altera o
-# 51-boost3x.conf, não instala pacotes com sudo.
+# O que NÃO faz: não toca na saída de áudio do sistema (nenhum filtro, sink
+# virtual ou ganho é instalado no caminho de reprodução), não instala pacotes
+# com sudo.
 #
 # Requisitos: pipewire, rnnoise (headers), gcc.
 #   Arch:   sudo pacman -S rnnoise gcc python-gobject gtk3
@@ -122,10 +123,20 @@ install -m755 "$HERE/app/nvclean-app" "$BIN_DIR/nvclean-app"
 echo "  $BIN_DIR/nvclean-control"
 echo "  $BIN_DIR/nvclean-app"
 
-# atalho no menu de aplicativos
+# atalho no menu de aplicativos.
+# O ícone precisa existir no tema: Icon=nvclean só resolve se
+# nvclean.png estiver em hicolor/<tamanho>/apps. Sem isso o menu e a barra
+# de apps abertos caem no ícone genérico.
 APPS_DIR="$HOME/.local/share/applications"
-mkdir -p "$APPS_DIR"
+ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
+mkdir -p "$APPS_DIR" "$ICON_DIR"
+install -m644 "$HERE/packaging/nvclean.png" "$ICON_DIR/nvclean.png"
 install -m644 "$HERE/app/nvclean.desktop" "$APPS_DIR/nvclean.desktop"
+# atualiza o cache de ícones quando a ferramenta existe (não é obrigatória:
+# o GTK também procura no diretório hicolor diretamente)
+command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+  gtk-update-icon-cache -q -t -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+echo "  $ICON_DIR/nvclean.png"
 echo "  $APPS_DIR/nvclean.desktop"
 
 # serviço que mantém o microfone ligado após reiniciar o PipeWire
