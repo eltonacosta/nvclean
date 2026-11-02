@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 eltonacosta
+ *
  * nvclean_rnnoise_stereo.c — LADSPA estéreo do RNNoise (2 instâncias).
  *
  * Por que estéreo: o microfone HyperX QuadCast entrega 2 canais. Linkar apenas

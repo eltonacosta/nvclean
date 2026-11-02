@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 eltonacosta
 # ============================================================================
 # setup-denoiser.sh — instala o filtro de ruído de ENTRADA (microfone) no Linux.
 #

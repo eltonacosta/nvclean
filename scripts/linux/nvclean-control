@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 eltonacosta
 """nvclean-control — controlador do filtro de ruído de ENTRADA (microfone).
 
 Escopo: manipula SOMENTE o filtro do microfone (nós "nvclean.input" /

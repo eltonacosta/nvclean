@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 eltonacosta
 """Verifica que a SAÍDA de áudio do sistema não foi alterada pelo nvclean.
 
 Compara o estado atual com um baseline salvo antes de instalar/executar:

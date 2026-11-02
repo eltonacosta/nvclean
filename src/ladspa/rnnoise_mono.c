@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 eltonacosta
+ *
  * nvclean_rnnoise_mono.c — LADSPA mono wrapper para o RNNoise.
  *
  * Por que existe: o plugin LADSPA oficial do RNNoise (lib/rnnoise_ladspa.c no

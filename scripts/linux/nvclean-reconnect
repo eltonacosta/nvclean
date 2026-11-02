@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 eltonacosta
 # ============================================================================
 # nvclean-reconnect — garante que o microfone escolhido continue ligado ao
 # filtro, mesmo depois de reiniciar o PipeWire ou reconectar o dispositivo.

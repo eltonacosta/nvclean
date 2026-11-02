@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 eltonacosta
 # ============================================================================
 # build-appimage.sh — gera o AppImage do nvclean.
 #
@@ -134,6 +136,11 @@ cp "$APPDIR/nvclean.png" "$APPDIR/.DirIcon"
 
 # docs dentro do pacote
 install -m644 "$HERE/README.md" "$APPDIR/usr/share/nvclean/README.md"
+install -m644 "$HERE/CHANGELOG.md" "$APPDIR/usr/share/nvclean/CHANGELOG.md"
+# GPL-3.0 §4 e §6: a licença precisa acompanhar o binário distribuído, e o
+# aviso do RNNoise (BSD-3) é exigido na redistribuição da librnnoise.so.0.
+install -m644 "$HERE/LICENSE" "$APPDIR/usr/share/nvclean/LICENSE"
+install -m644 "$HERE/THIRD-PARTY.md" "$APPDIR/usr/share/nvclean/THIRD-PARTY.md"
 install -m644 "$HERE/docs/RELATORIO-LIMPADOR-DE-VOZ.md" \
   "$APPDIR/usr/share/nvclean/RELATORIO-LIMPADOR-DE-VOZ.md"
 

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 eltonacosta
 """Host LADSPA mínimo para testar o plugin nvclean fora do PipeWire.
 
 Carrega o .so e processa um WAV, reportando o piso de ruído antes/depois.

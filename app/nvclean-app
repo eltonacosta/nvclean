@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 eltonacosta
 """nvclean — app de bandeja para o filtro de ruído de ENTRADA (microfone).
 
 Equivalente Linux do essencial do NVIDIA Broadcast: um interruptor para o
@@ -1444,6 +1446,21 @@ def main(argv: list[str]) -> int:
             hint.set_line_wrap(True)
             hint.set_max_width_chars(44)
             outer.pack_start(hint, False, False, 0)
+
+            # GPL-3.0 §5d — Appropriate Legal Notices em interface interativa:
+            # copyright, ausência de garantia e onde ver a licença.
+            legal = Gtk.Label(label="", xalign=0)
+            legal.get_style_context().add_class("subtitle")
+            legal.set_line_wrap(True)
+            legal.set_max_width_chars(44)
+            legal.set_markup(
+                "nvclean (Noise Vocal Clean) " + VERSION + "\n"
+                "Copyright (C) 2026 eltonacosta\n"
+                "Licenciado sob GPL-3.0 ou posterior, sem qualquer garantia.\n"
+                '<a href="https://www.gnu.org/licenses/gpl-3.0.html">'
+                "gnu.org/licenses/gpl-3.0</a>"
+            )
+            outer.pack_start(legal, False, False, 0)
 
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             row.set_halign(Gtk.Align.END)
